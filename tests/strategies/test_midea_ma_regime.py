@@ -21,6 +21,7 @@ from src.trader.strategies.midea_timing import (
     MaRegimeStrategy,
     compute_ma,
     ma_regime_signal,
+    size_board_lots,
 )
 
 BASE = datetime(2020, 1, 1)
@@ -217,6 +218,80 @@ class GapUpCashTests(unittest.TestCase):
         self.assertGreaterEqual(s.cash, 0.0)        # no synthetic leverage
         self.assertGreaterEqual(s.pos, 0)
         self.assertGreaterEqual(s.min_pos, 0)
+
+
+class CostAwareLedgerTests(unittest.TestCase):
+    """The sizing cash ledger must deduct the engine's commission/slippage."""
+
+    RATE = 0.0003
+    SLIP = 0.01
+
+    def make(self):
+        return RecordingStrategy(commission_rate=self.RATE, slippage_per_share=self.SLIP)
+
+    def expected(self, cash, direction, volume, price):
+        notional = volume * price
+        cost = notional * self.RATE + volume * self.SLIP
+        return cash - notional - cost if direction == Direction.LONG else cash + notional - cost
+
+    def test_buy_reduces_cash_by_notional_plus_costs(self):
+        s = self.make()
+        s.fill(Direction.LONG, 1000, 10.0)
+        expected = self.expected(s.target_capital, Direction.LONG, 1000, 10.0)
+        self.assertAlmostEqual(s.cash, expected, places=6)
+        self.assertAlmostEqual(s.cash, 1_000_000 - 10_000 - 3 - 10, places=6)
+
+    def test_sell_adds_proceeds_net_of_costs(self):
+        s = self.make()
+        s.fill(Direction.LONG, 1000, 10.0)
+        after_buy = s.cash
+        s.fill(Direction.SHORT, 1000, 12.0)
+        expected = self.expected(after_buy, Direction.SHORT, 1000, 12.0)
+        self.assertAlmostEqual(s.cash, expected, places=6)
+
+    def test_multi_round_trip_ledger_does_not_drift(self):
+        s = self.make()
+        trips = [
+            (Direction.LONG, 500, 8.0),
+            (Direction.SHORT, 500, 9.0),
+            (Direction.LONG, 400, 7.5),
+            (Direction.SHORT, 400, 8.8),
+            (Direction.LONG, 600, 9.5),
+            (Direction.SHORT, 600, 10.2),
+        ]
+        expected = s.target_capital
+        for direction, volume, price in trips:
+            s.fill(direction, volume, price)
+            expected = self.expected(expected, direction, volume, price)
+        self.assertAlmostEqual(s.cash, expected, places=6)
+        # Gross-only accounting would have drifted above the cost-aware ledger.
+        gross_expected = s.target_capital
+        for direction, volume, price in trips:
+            gross_expected += volume * price if direction == Direction.SHORT else -volume * price
+        self.assertGreater(gross_expected, s.cash)
+
+
+class BoardLotSizingTests(unittest.TestCase):
+    """size_board_lots must reserve buy costs before selecting the lot."""
+
+    def test_reserves_buy_costs(self):
+        # capital=100k, price=1.00: naive notional sizing would buy 100,000
+        # shares costing 100,000 + 30 + 1,000 = 101,030 > capital.
+        naive = int(100_000 / 1.0 / 100) * 100
+        self.assertEqual(naive, 100_000)
+        naive_cost = naive * 1.0 * (1 + 0.0003) + naive * 0.01
+        self.assertGreater(naive_cost, 100_000)      # naive would overdraw
+
+        shares = size_board_lots(100_000, 1.0, 0.0003, 0.01, 100)
+        self.assertEqual(shares, 98_900)             # one lot fewer
+        self.assertEqual(shares % 100, 0)
+        cost = shares * 1.0 * (1 + 0.0003) + shares * 0.01
+        self.assertLessEqual(cost, 100_000)
+        self.assertGreaterEqual(100_000 - cost, 0)   # residual cash >= 0
+
+    def test_zero_when_no_full_lot_fits(self):
+        self.assertEqual(size_board_lots(1.0, 10.0, 0.0003, 0.01, 100), 0)
+        self.assertEqual(size_board_lots(0.0, 10.0, 0.0003, 0.01, 100), 0)
 
 
 class NextBarExecutionTests(unittest.TestCase):

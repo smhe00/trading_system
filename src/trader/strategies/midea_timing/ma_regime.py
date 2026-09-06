@@ -37,14 +37,36 @@ def ma_regime_signal(close, ma_fast, ma_mid, ma_slow) -> bool:
     return close > ma_slow and ma_fast > ma_mid
 
 
-class MaRegimeStrategy(CtaTemplate):
-    """Binary MA-regime timing for a long-only A-share daily backtest.
+def size_board_lots(
+    cash: float,
+    price: float,
+    commission_rate: float,
+    slippage_per_share: float,
+    lot_size: int = 100,
+) -> int:
+    """Largest multiple of ``lot_size`` whose total buy cash requirement fits.
 
-    Position state is 0% or 100%: when the LONG condition holds the strategy
-    invests ~all current equity (rounded down to board lots, with a
-    conservative reserve for next-bar gap and buy-side costs); otherwise it
-    is flat in cash. Equity is tracked by the strategy's own cash ledger
-    updated on fills, so sizing compounds as equity grows.
+    Total buy requirement = notional + commission + slippage:
+        shares * price * (1 + commission_rate) + shares * slippage_per_share
+    must not exceed ``cash``, so residual cash can never go negative from the
+    modeled buy costs. Returns 0 when no full lot fits.
+    """
+    if cash <= 0 or price <= 0 or lot_size <= 0:
+        return 0
+    per_share_cost = price * (1 + commission_rate) + slippage_per_share
+    return int(cash / per_share_cost / lot_size) * lot_size
+
+
+class MaRegimeStrategy(CtaTemplate):
+    """Conservative-capital MA-regime timing for a long-only A-share daily
+    backtest.
+
+    Position state is 0% or "conservative long": when the LONG condition
+    holds the strategy invests up to ~all current equity, rounded down to
+    board lots, but reserves a worst-case next-bar gap (``gap_buffer``) plus
+    buy-side costs — so typical deployed capital is below 100% (≈1/gap_buffer
+    before lot rounding) and cash can never go negative. When CASH it is
+    flat. The cost-aware cash ledger tracks economic cash across round trips.
 
     ``analysis_start`` ("YYYYMMDD") gates trading: bars before it may only
     warm the MA indicators — no order is submitted or filled before it, so
@@ -114,9 +136,13 @@ class MaRegimeStrategy(CtaTemplate):
             # Conservative sizing: reserve a worst-case next-open gap
             # (gap_buffer) plus buy commission and slippage, so the modeled
             # fill can never exceed available cash (no synthetic leverage).
+            # This is a "conservative-capital MA regime": the gap buffer
+            # deliberately caps deployed capital below 100%.
             max_price = bar.close_price * self.gap_buffer
-            cost_per_share = max_price * (1 + self.commission_rate) + self.slippage_per_share
-            target = int(self.cash / cost_per_share / self.lot_size) * self.lot_size
+            target = size_board_lots(
+                self.cash, max_price, self.commission_rate,
+                self.slippage_per_share, self.lot_size,
+            )
             if target >= self.lot_size:
                 # Wide limit so the backtester fills at the NEXT bar's open
                 # (next-tradable-bar execution; no same-close look-ahead).
@@ -128,11 +154,20 @@ class MaRegimeStrategy(CtaTemplate):
         pass
 
     def on_trade(self, trade) -> None:
-        """Update the cash ledger. Position is updated by the engine/backtester."""
+        """Update the cost-aware cash ledger used for future entry sizing.
+
+        The ledger deducts the same buy/sell commission and per-share
+        slippage assumptions passed to the backtest engine, so it stays
+        aligned with economic cash across repeated round trips. Stamp duty
+        is NOT included here — it is handled and disclosed separately for
+        this baseline (not charged by the vn.py engine either).
+        """
+        notional = trade.volume * trade.price
+        cost = notional * self.commission_rate + trade.volume * self.slippage_per_share
         if trade.direction == Direction.LONG:
-            self.cash -= trade.volume * trade.price
+            self.cash -= notional + cost
         else:
-            self.cash += trade.volume * trade.price
+            self.cash += notional - cost
         self.write_log(
             f"trade {trade.direction.value} vol={trade.volume} px={trade.price:.3f}"
         )

@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.trader.strategies.midea_timing import MaRegimeStrategy
+from src.trader.strategies.midea_timing import MaRegimeStrategy, size_board_lots
 
 SYMBOL = "000333.SZ"        # market symbol (xtdata / CSV)
 VT_SYMBOL = "000333.SZSE"   # vn.py vt_symbol (vn.py exchange value suffix)
@@ -33,6 +33,7 @@ COMMISSION_RATE = 0.0003        # 万3, both sides
 SLIPPAGE = 0.01                 # one tick per share
 STAMP_DUTY = 0.0005             # 0.05% on sells only (not modeled by vn.py engine)
 LOT_SIZE = 100                  # A-share board lot
+GAP_BUFFER = 1.20               # strategy worst-case next-open gap reserve (sizing)
 
 
 def load_bars_csv(csv_path: Path, start: str = "", end: str = "") -> list:
@@ -185,7 +186,10 @@ def run_buy_and_hold(bars: list, start: str) -> dict:
 
     start_price = first.open_price
     end_price = last.close_price
-    shares = int(CAPITAL / start_price / LOT_SIZE) * LOT_SIZE
+    # Cost-aware board-lot sizing: the total buy cash requirement (notional +
+    # commission + slippage) must fit within CAPITAL, so residual cash cannot
+    # go negative from buy costs.
+    shares = size_board_lots(CAPITAL, start_price, COMMISSION_RATE, SLIPPAGE, LOT_SIZE)
     if shares < LOT_SIZE:
         raise RuntimeError("capital too small for one board lot")
 
@@ -259,6 +263,10 @@ def main():
     ma_metrics["entries"] = len(buys)
     ma_metrics["exits"] = len(sells)
     ma_metrics["n_trades"] = len(trades)
+    # Conservative-capital disclosure: the gap buffer caps deployed capital
+    # below 100% (≈ 1/gap_buffer before lot rounding).
+    ma_metrics["gap_buffer"] = GAP_BUFFER
+    ma_metrics["deployed_fraction_approx"] = round(1 / GAP_BUFFER, 4)
     turnover = sum(t.volume * t.price for t in trades)
     ma_metrics["total_turnover"] = round(turnover, 2)
     ma_metrics["annualized_turnover"] = round(turnover / CAPITAL / ma_metrics["years"], 4)
