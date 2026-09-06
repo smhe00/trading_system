@@ -57,6 +57,47 @@ def size_board_lots(
     return int(cash / per_share_cost / lot_size) * lot_size
 
 
+def terminal_liquidation(
+    equity: float,
+    shares: float,
+    price: float,
+    commission_rate: float,
+    slippage_per_share: float,
+    stamp_duty: float,
+) -> dict:
+    """Optional terminal-liquidation accounting for a position still held at
+    the final close.
+
+    When ``shares`` > 0, liquidated equity = ``equity`` minus the same
+    terminal sell commission, per-share slippage and stamp duty assumptions
+    used by the baseline; when ``shares`` == 0 the adjustment is zero and
+    liquidated equity equals ``equity``.
+
+    This is used identically for Buy & Hold and the MA regime (shared
+    convention). No fake trade is ever injected into the vn.py trade history.
+    """
+    if shares <= 0:
+        return {
+            "liquidated_final_equity": round(float(equity), 2),
+            "liquidation_adjustment": 0.0,
+            "terminal_sell_commission": 0.0,
+            "terminal_sell_slippage": 0.0,
+            "terminal_stamp_duty": 0.0,
+        }
+    notional = shares * price
+    commission = notional * commission_rate
+    slippage = shares * slippage_per_share
+    stamp = notional * stamp_duty
+    adjustment = commission + slippage + stamp
+    return {
+        "liquidated_final_equity": round(float(equity - adjustment), 2),
+        "liquidation_adjustment": round(adjustment, 2),
+        "terminal_sell_commission": round(commission, 2),
+        "terminal_sell_slippage": round(slippage, 2),
+        "terminal_stamp_duty": round(stamp, 2),
+    }
+
+
 class MaRegimeStrategy(CtaTemplate):
     """Conservative-capital MA-regime timing for a long-only A-share daily
     backtest.

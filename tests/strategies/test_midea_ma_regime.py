@@ -22,6 +22,7 @@ from src.trader.strategies.midea_timing import (
     compute_ma,
     ma_regime_signal,
     size_board_lots,
+    terminal_liquidation,
 )
 
 BASE = datetime(2020, 1, 1)
@@ -292,6 +293,113 @@ class BoardLotSizingTests(unittest.TestCase):
     def test_zero_when_no_full_lot_fits(self):
         self.assertEqual(size_board_lots(1.0, 10.0, 0.0003, 0.01, 100), 0)
         self.assertEqual(size_board_lots(0.0, 10.0, 0.0003, 0.01, 100), 0)
+
+
+class TerminalLiquidationTests(unittest.TestCase):
+    """Shared terminal-liquidation helper used by B&H and MA alike."""
+
+    RATE = 0.0003
+    SLIP = 0.01
+    STAMP = 0.0005
+
+    def test_open_position_liquidation_deducts_all_costs(self):
+        equity = 1_000_000.0
+        shares, price = 10_000, 90.0
+        notional = shares * price
+        commission = notional * self.RATE
+        slippage = shares * self.SLIP
+        stamp = notional * self.STAMP
+        res = terminal_liquidation(
+            equity, shares, price, self.RATE, self.SLIP, self.STAMP)
+        self.assertEqual(res["terminal_sell_commission"], round(commission, 2))
+        self.assertEqual(res["terminal_sell_slippage"], round(slippage, 2))
+        self.assertEqual(res["terminal_stamp_duty"], round(stamp, 2))
+        self.assertEqual(
+            res["liquidated_final_equity"],
+            round(equity - commission - slippage - stamp, 2),
+        )
+
+    def test_flat_position_liquidation_is_zero(self):
+        res = terminal_liquidation(
+            1_000_000.0, 0, 90.0, self.RATE, self.SLIP, self.STAMP)
+        self.assertEqual(res["liquidated_final_equity"], 1_000_000.0)
+        self.assertEqual(res["liquidation_adjustment"], 0.0)
+        for key in ("terminal_sell_commission", "terminal_sell_slippage",
+                    "terminal_stamp_duty"):
+            self.assertEqual(res[key], 0.0)
+
+
+class TerminalConventionTests(unittest.TestCase):
+    """B&H and MA must share the same start/terminal valuation conventions."""
+
+    def _engine_last_balance(self, bars, analysis_start="", capital=1_000_000):
+        from vnpy_ctastrategy.backtesting import BacktestingEngine
+
+        engine = BacktestingEngine()
+        engine.set_parameters(
+            vt_symbol="000333.SZSE", interval=Interval.DAILY,
+            start=BASE, rate=0.0003, slippage=0.01,
+            size=1.0, pricetick=0.01, capital=capital,
+        )
+        engine.add_strategy(MaRegimeStrategy, {"analysis_start": analysis_start})
+        engine.history_data = bars
+        engine.run_backtesting()
+        df = engine.calculate_result()
+        trades = engine.get_all_trades()
+        return engine, df, trades
+
+    def test_ma_ending_long_liquidation_matches_helper(self):
+        # Uptrend keeps the MA LONG at the end -> open position held.
+        engine, df, trades = self._engine_last_balance(bars_from_closes(uptrend()))
+        balance = engine.capital + df["net_pnl"].cumsum()
+        primary = float(balance.iloc[-1])
+        buys = [t for t in trades if t.direction == Direction.LONG]
+        sells = [t for t in trades if t.direction == Direction.SHORT]
+        final_shares = sum(t.volume for t in buys) - sum(t.volume for t in sells)
+        self.assertGreater(final_shares, 0)          # ends with an open position
+        last_close = float(df["close_price"].iloc[-1])
+        expected = terminal_liquidation(
+            primary, final_shares, last_close, 0.0003, 0.01, 0.0005)
+        self.assertLess(expected["liquidated_final_equity"], primary)
+        self.assertGreater(expected["liquidation_adjustment"], 0.0)
+        self.assertGreater(expected["terminal_stamp_duty"], 0.0)
+
+    def test_ma_ending_flat_liquidation_is_zero(self):
+        # Uptrend then sharp decline -> exits and stays flat at the end.
+        closes = uptrend() + [199.5 - 2.0 * j for j in range(80)]
+        engine, df, trades = self._engine_last_balance(bars_from_closes(closes))
+        balance = engine.capital + df["net_pnl"].cumsum()
+        primary = float(balance.iloc[-1])
+        buys = [t for t in trades if t.direction == Direction.LONG]
+        sells = [t for t in trades if t.direction == Direction.SHORT]
+        final_shares = sum(t.volume for t in buys) - sum(t.volume for t in sells)
+        self.assertEqual(final_shares, 0)            # flat at the end
+        last_close = float(df["close_price"].iloc[-1])
+        expected = terminal_liquidation(
+            primary, final_shares, last_close, 0.0003, 0.01, 0.0005)
+        self.assertAlmostEqual(expected["liquidated_final_equity"], primary, places=2)
+        self.assertAlmostEqual(expected["liquidation_adjustment"], 0.0, places=6)
+
+    def test_buy_and_hold_uses_same_anchor_and_liquidation_convention(self):
+        from scripts.midea_timing_backtest import run_buy_and_hold
+
+        bars = bars_from_closes(uptrend())
+        bh = run_buy_and_hold(bars, "20200101")
+        self.assertEqual(bh["start_equity"], 1_000_000.0)     # explicit anchor
+        shares = bh["shares"]
+        end_price = bh["end_price"]
+        # Primary final equity is mark-to-market (open position, no terminal
+        # exit cost deducted) -> it must exceed the liquidated value.
+        self.assertGreater(bh["final_equity"], bh["liquidated_final_equity"])
+        # Liquidated view must match the shared helper exactly.
+        expected = terminal_liquidation(
+            bh["final_equity"], shares, end_price, 0.0003, 0.01, 0.0005)
+        self.assertEqual(bh["liquidated_final_equity"],
+                         expected["liquidated_final_equity"])
+        self.assertEqual(bh["terminal_sell_commission"],
+                         expected["terminal_sell_commission"])
+        self.assertEqual(bh["terminal_stamp_duty"],
+                         expected["terminal_stamp_duty"])
 
 
 class NextBarExecutionTests(unittest.TestCase):

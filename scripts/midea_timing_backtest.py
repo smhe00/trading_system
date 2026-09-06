@@ -18,7 +18,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.trader.strategies.midea_timing import MaRegimeStrategy, size_board_lots
+from src.trader.strategies.midea_timing import (
+    MaRegimeStrategy,
+    size_board_lots,
+    terminal_liquidation,
+)
 
 SYMBOL = "000333.SZ"        # market symbol (xtdata / CSV)
 VT_SYMBOL = "000333.SZSE"   # vn.py vt_symbol (vn.py exchange value suffix)
@@ -169,14 +173,15 @@ def metrics_from_equity(balance, start_equity) -> dict:
 
 
 def run_buy_and_hold(bars: list, start: str) -> dict:
-    """Buy at the analysis-window open, hold, sell at the last close.
+    """Buy at the analysis-window open, hold, mark to market until the last
+    close (primary convention), with an optional terminal-liquidation view.
 
-    Models board-lot rounding, commission, slippage; stamp duty on the
-    terminal sell is reported separately.
+    Primary metrics use the common mark-to-market convention: an explicit
+    1,000,000 starting-equity anchor at the analysis-start open, then
+    close-marked equity (idle cash + position value) with the position still
+    held. Liquidated metrics use the shared terminal_liquidation helper.
     """
     import pandas as pd
-
-    from vnpy.trader.constant import Direction
 
     window = [b for b in bars if b.datetime.strftime("%Y%m%d") >= start]
     if not window:
@@ -195,19 +200,28 @@ def run_buy_and_hold(bars: list, start: str) -> dict:
 
     buy_cost = shares * start_price * COMMISSION_RATE + shares * SLIPPAGE
     sell_value = shares * end_price
-    sell_cost = sell_value * COMMISSION_RATE + shares * SLIPPAGE
     stamp = sell_value * STAMP_DUTY
     remaining_cash = CAPITAL - shares * start_price - buy_cost
-    proceeds = sell_value - sell_cost - stamp
-    final_equity = remaining_cash + proceeds
 
-    # Daily equity = idle residual cash + marked position value (buy cost paid).
-    daily_equity = pd.Series(
-        {b.datetime: remaining_cash + shares * b.close_price for b in window}
-    ).sort_index()
+    # Explicit common starting-equity anchor (1,000,000 at the analysis-start
+    # open), then close-marked equity. The first-period open->close move is
+    # therefore NOT silently omitted from the return statistics.
+    anchor = pd.Series([CAPITAL], index=[first.datetime])
+    marked = pd.Series(
+        [remaining_cash + shares * b.close_price for b in window],
+        index=[b.datetime for b in window],
+    )
+    daily_equity = pd.concat([anchor, marked]).sort_index()
     metrics = metrics_from_equity(daily_equity, CAPITAL)
-    metrics["final_equity"] = round(final_equity, 2)
-    metrics["cagr"] = round((final_equity / CAPITAL) ** (1 / metrics["years"]) - 1, 4)
+    # Primary final equity is mark-to-market (position still held).
+    metrics["final_equity"] = round(float(metrics["final_equity"]), 2)
+    # Optional terminal liquidation via the shared helper (same convention as MA).
+    metrics.update(terminal_liquidation(
+        metrics["final_equity"], shares, end_price,
+        COMMISSION_RATE, SLIPPAGE, STAMP_DUTY,
+    ))
+    metrics["liquidated_cagr"] = round(
+        (metrics["liquidated_final_equity"] / CAPITAL) ** (1 / metrics["years"]) - 1, 4)
     metrics["entries"] = 1
     metrics["exits"] = 1
     metrics["stamp_duty"] = round(stamp, 2)
@@ -272,11 +286,17 @@ def main():
     ma_metrics["annualized_turnover"] = round(turnover / CAPITAL / ma_metrics["years"], 4)
     stamp = sum(t.volume * t.price for t in sells) * STAMP_DUTY
     ma_metrics["stamp_duty"] = round(stamp, 2)
-    # Net-of-stamp variant uses the SAME common starting equity.
-    net_final = ma_metrics["final_equity"] - stamp
-    ma_metrics["final_equity_net"] = round(net_final, 2)
-    ma_metrics["cagr_net"] = round(
-        (net_final / CAPITAL) ** (1 / ma_metrics["years"]) - 1, 4)
+    # Optional terminal liquidation via the shared helper (MA may end with an
+    # open position; primary final equity is mark-to-market).
+    final_shares = sum(t.volume for t in buys) - sum(t.volume for t in sells)
+    last_close = float(df["close_price"].iloc[-1])
+    ma_metrics.update(terminal_liquidation(
+        ma_metrics["final_equity"], final_shares, last_close,
+        COMMISSION_RATE, SLIPPAGE, STAMP_DUTY,
+    ))
+    ma_metrics["liquidated_cagr"] = round(
+        (ma_metrics["liquidated_final_equity"] / CAPITAL) ** (1 / ma_metrics["years"]) - 1, 4)
+    ma_metrics["final_shares"] = int(final_shares)
 
     # Buy & Hold
     bh_metrics = run_buy_and_hold(bars, args.start)
@@ -284,7 +304,10 @@ def main():
     delta = {
         "delta_sharpe": round(ma_metrics["sharpe"] - bh_metrics["sharpe"], 4),
         "delta_maxdd": round(ma_metrics["max_drawdown"] - bh_metrics["max_drawdown"], 4),
-        "delta_cagr": round(ma_metrics["cagr_net"] - bh_metrics["cagr"], 4),
+        # Primary (mark-to-market) CAGR deltas on the common convention.
+        "delta_cagr": round(ma_metrics["cagr"] - bh_metrics["cagr"], 4),
+        "delta_cagr_liquidated": round(
+            ma_metrics["liquidated_cagr"] - bh_metrics["liquidated_cagr"], 4),
     }
 
     summary = {
