@@ -75,55 +75,82 @@ class QmtClient:
         return StockAccount(self.account_id)
 
     def _select_account_id(self) -> str:
+        """Select the unique STOCK account among all returned accounts.
+
+        The rule is: query all accounts, normalize their types, filter to
+        STOCK, then require exactly one STOCK account. Other account types
+        must not make a unique STOCK account ambiguous, and the total
+        account count is irrelevant.
+        """
         from xtquant import xtconstant
 
         infos = self._trader.query_account_infos()
         if infos is None:
             raise RuntimeError("MiniQMT returned None from query_account_infos")
-        if len(infos) != 1:
-            raise RuntimeError(
-                f"Expected exactly one MiniQMT account, found {len(infos)}; "
-                "this read-only gateway refuses ambiguous configuration"
-            )
-        info = infos[0]
-        kind = info.account_type
-        kind = kind.upper() if isinstance(kind, str) else xtconstant.ACCOUNT_TYPE_DICT.get(kind)
         expected = xtconstant.ACCOUNT_TYPE_DICT.get(ACCOUNT_TYPE_STOCK)
-        if kind != expected:
+        stock = []
+        for info in infos:
+            kind = info.account_type
+            kind = kind.upper() if isinstance(kind, str) else xtconstant.ACCOUNT_TYPE_DICT.get(kind)
+            if kind == expected:
+                stock.append(info)
+        if len(stock) != 1:
             raise RuntimeError(
-                f"This gateway supports {expected} accounts only; found {kind!r}"
+                f"Expected exactly one {expected} account, found {len(stock)} "
+                f"{expected} among {len(infos)} total; this read-only gateway "
+                "refuses ambiguous configuration"
             )
+        info = stock[0]
         if not isinstance(info.account_id, str) or not info.account_id.strip():
             raise RuntimeError("MiniQMT account_id is missing or invalid")
         return info.account_id
 
     # ------------------------------------------------------------------ #
+    # Account ownership validation (fail closed)
+    # ------------------------------------------------------------------ #
+    def _check_account(self, obj: Any, label: str) -> None:
+        """Raise unless ``obj.account_id`` equals the selected account id."""
+        account_id = getattr(obj, "account_id", None)
+        if account_id is None or account_id != self.account_id:
+            raise RuntimeError(
+                f"{label} returned a missing or different account: "
+                f"{account_id!r} (expected {self.account_id!r})"
+            )
+
+    # ------------------------------------------------------------------ #
     # Read-only queries
     # ------------------------------------------------------------------ #
     def query_account(self) -> Any:
-        """Return the current XtAsset or raise."""
+        """Return the current XtAsset or raise (ownership validated)."""
         asset = self._trader.query_stock_asset(self._account())
         if asset is None:
             raise RuntimeError("MiniQMT query_stock_asset returned None")
+        self._check_account(asset, "Asset")
         return asset
 
     def query_positions(self) -> list:
-        """Return the current positions or raise (None is not a valid empty)."""
+        """Return the current positions or raise (ownership validated)."""
         rows = self._trader.query_stock_positions(self._account())
         if rows is None:
             raise RuntimeError("MiniQMT query_stock_positions returned None")
+        for row in rows:
+            self._check_account(row, "Position")
         return rows
 
     def query_orders(self) -> list:
-        """Return today's orders or raise."""
+        """Return today's orders or raise (ownership validated)."""
         rows = self._trader.query_stock_orders(self._account(), cancelable_only=False)
         if rows is None:
             raise RuntimeError("MiniQMT query_stock_orders returned None")
+        for row in rows:
+            self._check_account(row, "Order")
         return rows
 
     def query_trades(self) -> list:
-        """Return today's trades or raise."""
+        """Return today's trades or raise (ownership validated)."""
         rows = self._trader.query_stock_trades(self._account())
         if rows is None:
             raise RuntimeError("MiniQMT query_stock_trades returned None")
+        for row in rows:
+            self._check_account(row, "Trade")
         return rows

@@ -10,10 +10,6 @@ from vnpy.trader.constant import Direction, Exchange
 from vnpy.trader.object import AccountData, OrderData, PositionData, TradeData
 
 from .constants import (
-    DEFAULT_ORDER_STATUS,
-    DEFAULT_ORDER_TYPE,
-    DIRECTION_BUY,
-    DIRECTION_SELL,
     EXCHANGE_MAP,
     OFFSET_NONE,
     ORDER_STATUS_MAP,
@@ -43,18 +39,31 @@ def parse_symbol(stock_code: str) -> tuple[str, Exchange]:
 
 
 def parse_time(value: Any) -> datetime | None:
-    """Parse a MiniQMT ``'yyyyMMddHHmmss'`` string into a datetime.
+    """Parse a MiniQMT order/trade time into a datetime.
 
-    Returns None for missing, empty, or unrecognized input (never raises).
+    Live MiniQMT returns Unix timestamps (epoch seconds, e.g. 1788485412);
+    the documentation format is 'yyyyMMddHHmmss'. Both are accepted. Returns
+    None for missing, empty, or unrecognized input (never raises).
     """
     if value in (None, ""):
         return None
-    text = str(value).strip()
-    if len(text) >= 14 and text[:14].isdigit():
+    if isinstance(value, (int, float)):
         try:
-            return datetime.strptime(text[:14], TIME_FORMAT)
-        except ValueError:
+            return datetime.fromtimestamp(value)
+        except (ValueError, OverflowError, OSError):
             return None
+    text = str(value).strip()
+    if text.isdigit():
+        if len(text) >= 14:
+            try:
+                return datetime.strptime(text[:14], TIME_FORMAT)
+            except ValueError:
+                return None
+        if 9 <= len(text) <= 11:  # epoch seconds as a digit string
+            try:
+                return datetime.fromtimestamp(int(text))
+            except (ValueError, OverflowError, OSError):
+                return None
     return None
 
 
@@ -103,38 +112,50 @@ def to_position(position: Any, gateway_name: str) -> PositionData:
     return data
 
 
-def to_direction(order_type: Any, direction: Any) -> Direction:
-    """Resolve vn.py Direction from XtQuant order_type / direction flag.
+def to_direction(order_type: Any, direction: Any = None) -> Direction:
+    """Resolve vn.py Direction for a STOCK order/trade.
 
-    XtQuant orders carry ``direction`` (48 buy / 49 sell) and ``order_type``
-    (23 buy / 24 sell). Either may be the only reliable source, so both are
-    tried before raising.
+    XtQuant documents that the ``direction`` field is not applicable to
+    stocks, while ``order_type`` (STOCK_BUY / STOCK_SELL) is the
+    authoritative buy/sell source. A conflicting ``direction`` value must
+    not override a valid stock ``order_type``; an unknown ``order_type``
+    fails closed.
     """
-    if direction in (DIRECTION_BUY, ORDER_TYPE_BUY):
+    if order_type == ORDER_TYPE_BUY:
         return Direction.LONG
-    if direction in (DIRECTION_SELL, ORDER_TYPE_SELL):
+    if order_type == ORDER_TYPE_SELL:
         return Direction.SHORT
-    if order_type in (DIRECTION_BUY, ORDER_TYPE_BUY):
-        return Direction.LONG
-    if order_type in (DIRECTION_SELL, ORDER_TYPE_SELL):
-        return Direction.SHORT
-    raise ValueError(f"Unknown XtQuant direction: order_type={order_type} direction={direction}")
+    raise ValueError(
+        f"Unknown XtQuant stock order_type: {order_type!r} (direction={direction!r})"
+    )
 
 
 def to_order(order: Any, gateway_name: str) -> OrderData:
-    """XtQuant Order -> vn.py OrderData."""
+    """XtQuant Order -> vn.py OrderData (fails closed on unknown enums)."""
     symbol, exchange = parse_symbol(order.stock_code)
+    try:
+        order_type = ORDER_TYPE_MAP[order.price_type]
+    except KeyError:
+        raise ValueError(
+            f"Unknown XtQuant price_type: {order.price_type!r}"
+        ) from None
+    try:
+        status = ORDER_STATUS_MAP[order.order_status]
+    except KeyError:
+        raise ValueError(
+            f"Unknown XtQuant order_status: {order.order_status!r}"
+        ) from None
     data = OrderData(
         symbol=symbol,
         exchange=exchange,
         orderid=str(order.order_id),
-        type=ORDER_TYPE_MAP.get(order.price_type, DEFAULT_ORDER_TYPE),
+        type=order_type,
         direction=to_direction(order.order_type, order.direction),
         offset=OFFSET_NONE,
         price=order.price,
         volume=order.order_volume,
         traded=order.traded_volume,
-        status=ORDER_STATUS_MAP.get(order.order_status, DEFAULT_ORDER_STATUS),
+        status=status,
         datetime=parse_time(order.order_time),
         gateway_name=gateway_name,
     )

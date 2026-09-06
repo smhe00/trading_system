@@ -88,6 +88,10 @@ class ParseTimeTests(unittest.TestCase):
     def test_parses_xtquant_format(self):
         self.assertEqual(parse_time("20240906103000"), datetime(2024, 9, 6, 10, 30, 0))
 
+    def test_parses_unix_timestamp(self):
+        self.assertEqual(parse_time(1788485412), datetime.fromtimestamp(1788485412))
+        self.assertEqual(parse_time("1788485412"), datetime.fromtimestamp(1788485412))
+
     def test_missing_or_bad_input_is_none(self):
         for value in (None, "", "garbage", "20240906"):
             with self.subTest(value=value):
@@ -131,15 +135,21 @@ class PositionConverterTests(unittest.TestCase):
 
 
 class DirectionConverterTests(unittest.TestCase):
-    def test_order_type_drives_direction(self):
+    def test_buy_derives_from_order_type(self):
         self.assertEqual(to_direction(23, None), Direction.LONG)
+
+    def test_sell_derives_from_order_type(self):
         self.assertEqual(to_direction(24, None), Direction.SHORT)
 
-    def test_direction_flag_drives_direction(self):
-        self.assertEqual(to_direction(None, 48), Direction.LONG)
-        self.assertEqual(to_direction(None, 49), Direction.SHORT)
+    def test_conflicting_direction_cannot_override_order_type(self):
+        self.assertEqual(to_direction(23, 49), Direction.LONG)
+        self.assertEqual(to_direction(24, 48), Direction.SHORT)
 
-    def test_unknown_raises(self):
+    def test_direction_flag_alone_is_not_authoritative(self):
+        with self.assertRaises(ValueError):
+            to_direction(99, 48)
+
+    def test_unknown_order_type_raises(self):
         with self.assertRaises(ValueError):
             to_direction(99, 88)
 
@@ -164,6 +174,9 @@ class OrderConverterTests(unittest.TestCase):
     def test_market_price_type_maps_to_market(self):
         self.assertEqual(to_order(order(price_type=5), GATEWAY).type, OrderType.MARKET)
 
+    def test_repo_price_type_maps_to_limit(self):
+        self.assertEqual(to_order(order(price_type=55), GATEWAY).type, OrderType.LIMIT)
+
     def test_status_map(self):
         cases = {
             48: Status.SUBMITTING, 49: Status.SUBMITTING, 50: Status.NOTTRADED,
@@ -177,6 +190,18 @@ class OrderConverterTests(unittest.TestCase):
 
     def test_sell_direction(self):
         self.assertEqual(to_order(order(order_type=24, direction=49), GATEWAY).direction, Direction.SHORT)
+
+    def test_unknown_price_type_rejected(self):
+        with self.assertRaisesRegex(ValueError, "price_type"):
+            to_order(order(price_type=999), GATEWAY)
+
+    def test_unknown_order_status_rejected(self):
+        with self.assertRaisesRegex(ValueError, "order_status"):
+            to_order(order(order_status=999), GATEWAY)
+
+    def test_unknown_order_type_rejected(self):
+        with self.assertRaisesRegex(ValueError, "order_type"):
+            to_order(order(order_type=99), GATEWAY)
 
 
 class TradeConverterTests(unittest.TestCase):

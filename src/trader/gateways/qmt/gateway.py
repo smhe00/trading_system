@@ -8,7 +8,7 @@ integration can never touch a real trading API.
 """
 from vnpy.trader.constant import Exchange
 from vnpy.trader.gateway import BaseGateway
-from vnpy.trader.object import CancelRequest, OrderRequest, SubscribeRequest
+from vnpy.trader.object import CancelRequest, OrderRequest, PositionData, SubscribeRequest
 
 from .client import QmtClient
 from .constants import DEFAULT_QMT_PATH, GATEWAY_NAME, READ_ONLY_MESSAGE
@@ -28,26 +28,42 @@ class QmtGateway(BaseGateway):
     def __init__(self, event_engine, gateway_name: str) -> None:
         super().__init__(event_engine, gateway_name)
         self.client: QmtClient | None = None
+        # Identity keys (symbol, exchange, direction) seen by the last full
+        # position snapshot; used to clear positions that disappeared.
+        self.position_keys: set[tuple] = set()
 
     # ------------------------------------------------------------------ #
     # Connection management
     # ------------------------------------------------------------------ #
     def connect(self, setting: dict) -> None:
-        """Connect to MiniQMT and push an initial snapshot into vn.py."""
+        """Connect to MiniQMT and push an initial snapshot into vn.py.
+
+        The whole connect + initial snapshot is transactional: any failure
+        closes the XtQuant session and leaves the gateway disconnected.
+        Connecting while already connected is explicitly rejected so a
+        session can never be leaked or silently replaced.
+        """
+        if self.client is not None:
+            raise RuntimeError(
+                "QmtGateway is already connected; call close() before reconnecting"
+            )
         qmt_path = setting.get("QMT路径") or setting.get("qmt_path") or DEFAULT_QMT_PATH
         session_id = setting.get("会话ID") or setting.get("session_id") or 0
         self.client = QmtClient(qmt_path=qmt_path, session_id=session_id)
         try:
             self.client.connect()
+            self.query_account()
+            self.query_position()
+            self.query_orders()
+            self.query_trades()
         except Exception:
-            self.client = None
+            if self.client is not None:
+                try:
+                    self.client.close()
+                finally:
+                    self.client = None
             raise
         self.write_log(f"QmtGateway({self.gateway_name}) read-only connect: OK")
-        # Initial pull so the vn.py OMS is populated right after connect.
-        self.query_account()
-        self.query_position()
-        self.query_orders()
-        self.query_trades()
         self.write_log("QmtGateway initial snapshot pushed to OMS")
 
     def close(self) -> None:
@@ -55,6 +71,7 @@ class QmtGateway(BaseGateway):
         if self.client is not None:
             self.client.close()
             self.client = None
+        self.position_keys.clear()
 
     # ------------------------------------------------------------------ #
     # Read-only queries (each re-pulls from MiniQMT and pushes events)
@@ -66,11 +83,34 @@ class QmtGateway(BaseGateway):
         self.on_account(to_account(self.client.query_account(), self.gateway_name))
 
     def query_position(self) -> None:
+        """Push current positions and clear previously seen but now absent ones.
+
+        A full snapshot represents current broker truth: for every identity
+        seen by an earlier snapshot that is missing now, a zero-volume
+        PositionData is emitted so vn.py OMS does not retain stale holdings.
+        """
         if self.client is None:
             self.write_log("QmtGateway not connected; cannot query position")
             return
-        for position in self.client.query_positions():
-            self.on_position(to_position(position, self.gateway_name))
+        rows = self.client.query_positions()
+        current_keys: set[tuple] = set()
+        for position in rows:
+            data = to_position(position, self.gateway_name)
+            current_keys.add((data.symbol, data.exchange, data.direction))
+            self.on_position(data)
+        for key in self.position_keys - current_keys:
+            symbol, exchange, direction = key
+            clearing = PositionData(
+                symbol=symbol,
+                exchange=exchange,
+                direction=direction,
+                volume=0,
+                frozen=0,
+                price=0.0,
+                gateway_name=self.gateway_name,
+            )
+            self.on_position(clearing)
+        self.position_keys = current_keys
 
     def query_orders(self) -> None:
         if self.client is None:

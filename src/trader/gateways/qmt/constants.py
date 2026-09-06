@@ -23,14 +23,21 @@ EXCHANGE_MAP = {
 }
 
 # XtQuant price_type -> vn.py OrderType.
-# 11 = FIX_PRICE (limit), 5 = LATEST_PRICE (market).
+# 11 = FIX_PRICE (fixed/limit), 5 = LATEST_PRICE (market-like).
+# 55 = repo (国债逆回购) yield-quote price type: not in the installed SDK's
+# PRTP_* list (0-14) but observed in this environment on real GC001 repo
+# orders (stock_code 204001.SH, order_type STOCK_SELL). A repo order is
+# quoted at a fixed yield, so it maps to LIMIT semantics. This mapping was
+# derived from real broker data and should be re-confirmed with broker docs.
+# Any other unknown price_type fails closed in the converter (no default).
 ORDER_TYPE_MAP = {
     11: OrderType.LIMIT,
     5: OrderType.MARKET,
+    55: OrderType.LIMIT,  # repo yield-quote (observed live on 204001.SH)
 }
-DEFAULT_ORDER_TYPE = OrderType.LIMIT
 
 # XtQuant order_status -> vn.py Status.
+# Unknown order_status must fail closed in the converter (no silent default).
 ORDER_STATUS_MAP = {
     48: Status.SUBMITTING,    # ORDER_UNREPORTED
     49: Status.SUBMITTING,    # ORDER_WAIT_REPORTING
@@ -44,7 +51,6 @@ ORDER_STATUS_MAP = {
     57: Status.REJECTED,      # ORDER_JUNK
     255: Status.REJECTED,     # ORDER_UNKNOWN
 }
-DEFAULT_ORDER_STATUS = Status.NOTTRADED
 
 # XtQuant direction flags (DIRECTION_FLAG_BUY=48 / DIRECTION_FLAG_SELL=49).
 DIRECTION_BUY = 48
