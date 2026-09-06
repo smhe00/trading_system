@@ -1,0 +1,6 @@
+.venv/
+.vntrader/
+__pycache__/
+*.py[cod]
+work/
+.env
