@@ -103,8 +103,12 @@ def fetch_bars_xtdata(start: str, end: str) -> list:
     return load_bars_csv(csv_path, start, end)
 
 
-def run_ma_backtest(bars: list):
-    """Run the MA-regime strategy through vnpy_ctastrategy BacktestingEngine."""
+def run_ma_backtest(bars: list, analysis_start: str):
+    """Run the MA-regime strategy through vnpy_ctastrategy BacktestingEngine.
+
+    ``analysis_start`` gates trading: bars before it only warm the MA
+    indicators, so the strategy starts the scored window flat at CAPITAL.
+    """
     from vnpy.trader.constant import Interval
     from vnpy_ctastrategy.base import BacktestingMode
     from vnpy_ctastrategy.backtesting import BacktestingEngine
@@ -123,7 +127,11 @@ def run_ma_backtest(bars: list):
         mode=BacktestingMode.BAR,
         annual_days=ANNUAL_DAYS,
     )
-    engine.add_strategy(MaRegimeStrategy, {})
+    engine.add_strategy(MaRegimeStrategy, {
+        "analysis_start": analysis_start,
+        "commission_rate": COMMISSION_RATE,
+        "slippage_per_share": SLIPPAGE,
+    })
     engine.history_data = bars            # this vnpy_ctastrategy version has no add_data()
     engine.run_backtesting()
     df = engine.calculate_result()
@@ -131,23 +139,24 @@ def run_ma_backtest(bars: list):
     return engine, df, trades
 
 
-def metrics_from_equity(balance):
-    """CAGR / annualized vol / Sharpe / MaxDD / Calmar from a daily balance series."""
+def metrics_from_equity(balance, start_equity) -> dict:
+    """CAGR / annualized vol / Sharpe / MaxDD / Calmar from a daily balance
+    series, all referring to one explicit common starting equity."""
     import pandas as pd
 
     s = balance.dropna()
     if len(s) < 2:
         return {}
     years = len(s) / ANNUAL_DAYS
-    start_v = s.iloc[0]
     end_v = s.iloc[-1]
-    cagr_curve = (end_v / start_v) ** (1 / years) - 1
+    cagr_curve = (end_v / start_equity) ** (1 / years) - 1
     daily_ret = s.pct_change().dropna()
     ann_vol = daily_ret.std(ddof=1) * math.sqrt(ANNUAL_DAYS)
     sharpe = (daily_ret.mean() * ANNUAL_DAYS) / ann_vol if ann_vol else float("nan")
     max_dd = -(s / s.cummax() - 1).min()
     calmar = cagr_curve / max_dd if max_dd else float("nan")
     return {
+        "start_equity": round(float(start_equity), 2),
         "final_equity": round(float(end_v), 2),
         "cagr": round(cagr_curve, 4),
         "annualized_vol": round(ann_vol, 4),
@@ -188,10 +197,11 @@ def run_buy_and_hold(bars: list, start: str) -> dict:
     proceeds = sell_value - sell_cost - stamp
     final_equity = remaining_cash + proceeds
 
+    # Daily equity = idle residual cash + marked position value (buy cost paid).
     daily_equity = pd.Series(
-        {b.datetime: shares * b.close_price - buy_cost for b in window}
+        {b.datetime: remaining_cash + shares * b.close_price for b in window}
     ).sort_index()
-    metrics = metrics_from_equity(daily_equity)
+    metrics = metrics_from_equity(daily_equity, CAPITAL)
     metrics["final_equity"] = round(final_equity, 2)
     metrics["cagr"] = round((final_equity / CAPITAL) ** (1 / metrics["years"]) - 1, 4)
     metrics["entries"] = 1
@@ -229,13 +239,20 @@ def main():
     from vnpy.trader.constant import Direction
 
     # MA regime (vnpy_ctastrategy)
-    engine, df, trades = run_ma_backtest(bars)
+    engine, df, trades = run_ma_backtest(bars, args.start)
     import pandas as pd
     df = df.copy()
     df["balance"] = df["net_pnl"].cumsum() + engine.capital
     df.index = pd.to_datetime(df.index)
     balance = df["balance"][df.index >= pd.to_datetime(args.start)]
-    ma_metrics = metrics_from_equity(balance)
+    # Common initial state must hold by construction (no pre-start trades).
+    start_equity = float(balance.iloc[0])
+    if abs(start_equity - CAPITAL) > 1e-6:
+        raise RuntimeError(
+            f"MA analysis-window starting equity {start_equity:.2f} != "
+            f"common capital {CAPITAL:.2f}"
+        )
+    ma_metrics = metrics_from_equity(balance, CAPITAL)
 
     buys = [t for t in trades if t.direction == Direction.LONG]
     sells = [t for t in trades if t.direction == Direction.SHORT]
@@ -247,7 +264,7 @@ def main():
     ma_metrics["annualized_turnover"] = round(turnover / CAPITAL / ma_metrics["years"], 4)
     stamp = sum(t.volume * t.price for t in sells) * STAMP_DUTY
     ma_metrics["stamp_duty"] = round(stamp, 2)
-    # Net-of-stamp final equity / CAGR (engine already nets commission+slippage)
+    # Net-of-stamp variant uses the SAME common starting equity.
     net_final = ma_metrics["final_equity"] - stamp
     ma_metrics["final_equity_net"] = round(net_final, 2)
     ma_metrics["cagr_net"] = round(

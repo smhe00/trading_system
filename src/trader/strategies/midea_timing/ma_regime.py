@@ -7,6 +7,7 @@ Position state is 0% or 100%; A-share long-only (no short selling).
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
 from vnpy.trader.constant import Direction
@@ -40,9 +41,15 @@ class MaRegimeStrategy(CtaTemplate):
     """Binary MA-regime timing for a long-only A-share daily backtest.
 
     Position state is 0% or 100%: when the LONG condition holds the strategy
-    invests ~all current equity (rounded down to board lots); otherwise it is
-    flat in cash. Equity is tracked by the strategy's own cash ledger updated
-    on fills, so sizing compounds as equity grows.
+    invests ~all current equity (rounded down to board lots, with a
+    conservative reserve for next-bar gap and buy-side costs); otherwise it
+    is flat in cash. Equity is tracked by the strategy's own cash ledger
+    updated on fills, so sizing compounds as equity grows.
+
+    ``analysis_start`` ("YYYYMMDD") gates trading: bars before it may only
+    warm the MA indicators — no order is submitted or filled before it, so
+    both strategies always start the scored window flat with the common
+    initial capital.
     """
 
     author = "agent"
@@ -52,8 +59,15 @@ class MaRegimeStrategy(CtaTemplate):
     slow_window = 120
     lot_size = 100
     target_capital = 1_000_000.0
+    analysis_start = ""
+    commission_rate = 0.0003
+    slippage_per_share = 0.01
+    gap_buffer = 1.20
 
-    parameters = ["fast_window", "mid_window", "slow_window", "lot_size", "target_capital"]
+    parameters = [
+        "fast_window", "mid_window", "slow_window", "lot_size", "target_capital",
+        "analysis_start", "commission_rate", "slippage_per_share", "gap_buffer",
+    ]
     variables = ["last_price", "cash"]
 
     def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
@@ -61,6 +75,10 @@ class MaRegimeStrategy(CtaTemplate):
         self.am = ArrayManager(size=self.slow_window + 1)
         self.last_price = 0.0
         self.cash = self.target_capital
+        self.start_dt = (
+            datetime.strptime(self.analysis_start, "%Y%m%d")
+            if self.analysis_start else datetime.min
+        )
 
     def on_init(self) -> None:
         """History is fed through the backtest engine's add_data, so the
@@ -80,6 +98,10 @@ class MaRegimeStrategy(CtaTemplate):
             return
         self.last_price = bar.close_price
 
+        # Bars before analysis_start may warm indicators but must not trade.
+        if bar.datetime < self.start_dt:
+            return
+
         close = self.am.close[-1]
         ma_fast = self.am.sma(self.fast_window)
         ma_mid = self.am.sma(self.mid_window)
@@ -89,8 +111,12 @@ class MaRegimeStrategy(CtaTemplate):
 
         if long_condition and self.pos == 0:
             # All-in on current equity, rounded down to the board lot (100).
-            equity = self.cash + self.pos * bar.close_price
-            target = int(equity / bar.close_price / self.lot_size) * self.lot_size
+            # Conservative sizing: reserve a worst-case next-open gap
+            # (gap_buffer) plus buy commission and slippage, so the modeled
+            # fill can never exceed available cash (no synthetic leverage).
+            max_price = bar.close_price * self.gap_buffer
+            cost_per_share = max_price * (1 + self.commission_rate) + self.slippage_per_share
+            target = int(self.cash / cost_per_share / self.lot_size) * self.lot_size
             if target >= self.lot_size:
                 # Wide limit so the backtester fills at the NEXT bar's open
                 # (next-tradable-bar execution; no same-close look-ahead).
