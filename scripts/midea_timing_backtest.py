@@ -8,7 +8,7 @@ Usage:
     python scripts/midea_timing_backtest.py --fetch   # pull from local miniQMT
 """
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import math
 from pathlib import Path
@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 
 from src.trader.strategies.midea_timing import (
     MaRegimeStrategy,
+    build_anchored_series,
     size_board_lots,
     terminal_liquidation,
 )
@@ -146,13 +147,19 @@ def run_ma_backtest(bars: list, analysis_start: str):
 
 def metrics_from_equity(balance, start_equity) -> dict:
     """CAGR / annualized vol / Sharpe / MaxDD / Calmar from a daily balance
-    series, all referring to one explicit common starting equity."""
+    series, all referring to one explicit common starting equity.
+
+    Both scored series are built as ``anchor + N closes``, so the number of
+    scored return periods is ``len(series) - 1`` and duration is derived from
+    that common period count — identical for Buy & Hold and MA.
+    """
     import pandas as pd
 
     s = balance.dropna()
     if len(s) < 2:
         return {}
-    years = len(s) / ANNUAL_DAYS
+    period_count = len(s) - 1
+    years = period_count / ANNUAL_DAYS
     end_v = s.iloc[-1]
     cagr_curve = (end_v / start_equity) ** (1 / years) - 1
     daily_ret = s.pct_change().dropna()
@@ -168,7 +175,8 @@ def metrics_from_equity(balance, start_equity) -> dict:
         "sharpe": round(sharpe, 4),
         "max_drawdown": round(max_dd, 4),
         "calmar": round(calmar, 4),
-        "years": round(years, 2),
+        "period_count": int(period_count),
+        "years": round(years, 4),
     }
 
 
@@ -200,21 +208,28 @@ def run_buy_and_hold(bars: list, start: str) -> dict:
 
     buy_cost = shares * start_price * COMMISSION_RATE + shares * SLIPPAGE
     sell_value = shares * end_price
-    stamp = sell_value * STAMP_DUTY
     remaining_cash = CAPITAL - shares * start_price - buy_cost
 
-    # Explicit common starting-equity anchor (1,000,000 at the analysis-start
-    # open), then close-marked equity. The first-period open->close move is
-    # therefore NOT silently omitted from the return statistics.
-    anchor = pd.Series([CAPITAL], index=[first.datetime])
-    marked = pd.Series(
+    # Shared scored equity shape: explicit 1,000,000 start-open anchor then
+    # one close-marked point per analysis trading bar. Anchor timestamp is
+    # strictly before the first close so the first open->close return exists.
+    anchor_ts = first.datetime - timedelta(seconds=1)
+    daily_equity = build_anchored_series(
+        CAPITAL, anchor_ts,
         [remaining_cash + shares * b.close_price for b in window],
-        index=[b.datetime for b in window],
+        [b.datetime for b in window],
     )
-    daily_equity = pd.concat([anchor, marked]).sort_index()
     metrics = metrics_from_equity(daily_equity, CAPITAL)
     # Primary final equity is mark-to-market (position still held).
     metrics["final_equity"] = round(float(metrics["final_equity"]), 2)
+    # Primary MTM activity: one entry, NO terminal exit, entry-only turnover,
+    # zero realized stamp duty (the position is still open).
+    metrics["entries"] = 1
+    metrics["exits"] = 0
+    metrics["primary_turnover"] = round(shares * start_price, 2)
+    metrics["annualized_turnover"] = round(
+        metrics["primary_turnover"] / CAPITAL / metrics["years"], 4)
+    metrics["realized_stamp_duty"] = 0.0
     # Optional terminal liquidation via the shared helper (same convention as MA).
     metrics.update(terminal_liquidation(
         metrics["final_equity"], shares, end_price,
@@ -222,16 +237,14 @@ def run_buy_and_hold(bars: list, start: str) -> dict:
     ))
     metrics["liquidated_cagr"] = round(
         (metrics["liquidated_final_equity"] / CAPITAL) ** (1 / metrics["years"]) - 1, 4)
-    metrics["entries"] = 1
-    metrics["exits"] = 1
-    metrics["stamp_duty"] = round(stamp, 2)
+    # Liquidated-view activity (terminal sale included).
+    metrics["liquidated_exits"] = 1
+    metrics["liquidated_total_turnover"] = round(shares * start_price + sell_value, 2)
+    metrics["liquidated_annualized_turnover"] = round(
+        metrics["liquidated_total_turnover"] / CAPITAL / metrics["years"], 4)
     metrics["shares"] = shares
     metrics["start_price"] = round(start_price, 3)
     metrics["end_price"] = round(end_price, 3)
-    metrics["total_turnover"] = round(
-        shares * start_price + sell_value, 2)
-    metrics["annualized_turnover"] = round(
-        (shares * start_price + sell_value) / CAPITAL / metrics["years"], 4)
     return metrics
 
 
@@ -270,22 +283,29 @@ def main():
             f"MA analysis-window starting equity {start_equity:.2f} != "
             f"common capital {CAPITAL:.2f}"
         )
-    ma_metrics = metrics_from_equity(balance, CAPITAL)
+    # Shared scored equity shape: explicit 1,000,000 start-open anchor then
+    # the close-marked balance points. MA is flat on the first analysis day,
+    # so the first-period return is an explicit 0%.
+    anchor_ts = balance.index[0] - pd.Timedelta(seconds=1)
+    daily_equity = build_anchored_series(
+        CAPITAL, anchor_ts, balance.values, balance.index)
+    ma_metrics = metrics_from_equity(daily_equity, CAPITAL)
 
     buys = [t for t in trades if t.direction == Direction.LONG]
     sells = [t for t in trades if t.direction == Direction.SHORT]
+    # Primary MTM activity: only actual vn.py trades (no artificial terminal exit).
     ma_metrics["entries"] = len(buys)
     ma_metrics["exits"] = len(sells)
     ma_metrics["n_trades"] = len(trades)
+    turnover = sum(t.volume * t.price for t in trades)
+    ma_metrics["primary_turnover"] = round(turnover, 2)
+    ma_metrics["annualized_turnover"] = round(turnover / CAPITAL / ma_metrics["years"], 4)
+    ma_metrics["realized_stamp_duty"] = round(
+        sum(t.volume * t.price for t in sells) * STAMP_DUTY, 2)
     # Conservative-capital disclosure: the gap buffer caps deployed capital
     # below 100% (≈ 1/gap_buffer before lot rounding).
     ma_metrics["gap_buffer"] = GAP_BUFFER
     ma_metrics["deployed_fraction_approx"] = round(1 / GAP_BUFFER, 4)
-    turnover = sum(t.volume * t.price for t in trades)
-    ma_metrics["total_turnover"] = round(turnover, 2)
-    ma_metrics["annualized_turnover"] = round(turnover / CAPITAL / ma_metrics["years"], 4)
-    stamp = sum(t.volume * t.price for t in sells) * STAMP_DUTY
-    ma_metrics["stamp_duty"] = round(stamp, 2)
     # Optional terminal liquidation via the shared helper (MA may end with an
     # open position; primary final equity is mark-to-market).
     final_shares = sum(t.volume for t in buys) - sum(t.volume for t in sells)
@@ -296,6 +316,12 @@ def main():
     ))
     ma_metrics["liquidated_cagr"] = round(
         (ma_metrics["liquidated_final_equity"] / CAPITAL) ** (1 / ma_metrics["years"]) - 1, 4)
+    # Liquidated-view activity (terminal sale included when a position remains).
+    ma_metrics["liquidated_exits"] = len(sells) + (1 if final_shares > 0 else 0)
+    liq_turnover = turnover + final_shares * last_close
+    ma_metrics["liquidated_total_turnover"] = round(liq_turnover, 2)
+    ma_metrics["liquidated_annualized_turnover"] = round(
+        liq_turnover / CAPITAL / ma_metrics["years"], 4)
     ma_metrics["final_shares"] = int(final_shares)
 
     # Buy & Hold

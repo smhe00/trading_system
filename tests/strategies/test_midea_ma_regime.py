@@ -19,6 +19,7 @@ from vnpy.trader.object import BarData, TradeData
 
 from src.trader.strategies.midea_timing import (
     MaRegimeStrategy,
+    build_anchored_series,
     compute_ma,
     ma_regime_signal,
     size_board_lots,
@@ -400,6 +401,75 @@ class TerminalConventionTests(unittest.TestCase):
                          expected["terminal_sell_commission"])
         self.assertEqual(bh["terminal_stamp_duty"],
                          expected["terminal_stamp_duty"])
+
+
+class MetricAlignmentTests(unittest.TestCase):
+    """B&H and MA must share the same start anchor / duration / period basis
+    and keep primary MTM activity metrics free of artificial terminal exits."""
+
+    ANNUAL_DAYS = 240
+
+    def _run_ma(self, bars, analysis_start):
+        import pandas as pd
+        from vnpy_ctastrategy.backtesting import BacktestingEngine
+
+        engine = BacktestingEngine()
+        engine.set_parameters(
+            vt_symbol="000333.SZSE", interval=Interval.DAILY, start=BASE,
+            rate=0.0003, slippage=0.01, size=1.0, pricetick=0.01,
+            capital=1_000_000,
+        )
+        engine.add_strategy(MaRegimeStrategy, {"analysis_start": analysis_start})
+        engine.history_data = bars
+        engine.run_backtesting()
+        df = engine.calculate_result()
+        bal = engine.capital + df["net_pnl"].cumsum()
+        bal.index = pd.to_datetime(bal.index)
+        bal = bal[bal.index >= pd.to_datetime(analysis_start)]
+        anchor_ts = bal.index[0] - pd.Timedelta(seconds=1)
+        series = build_anchored_series(1_000_000.0, anchor_ts, bal.values, bal.index)
+        return series
+
+    def test_anchored_series_shape_and_first_period_return(self):
+        ts0 = BASE - timedelta(seconds=1)
+        ts1, ts2 = BASE, BASE + timedelta(days=1)
+        s = build_anchored_series(1_000_000.0, ts0, [1_050_000.0, 1_100_000.0], [ts1, ts2])
+        self.assertEqual(len(s), 3)                  # anchor + N closes
+        self.assertEqual(s.iloc[0], 1_000_000.0)     # explicit start-open anchor
+        self.assertLess(s.index[0], s.index[1])      # unambiguous timestamps
+        # First-period return (anchor -> first close) is a real observation.
+        self.assertAlmostEqual(s.pct_change().dropna().iloc[0], 0.05)
+
+    def test_ma_first_analysis_day_is_explicit_zero_return(self):
+        start_date = (BASE + timedelta(days=150)).strftime("%Y%m%d")
+        s = self._run_ma(bars_from_closes(uptrend()), start_date)
+        self.assertEqual(s.iloc[0], 1_000_000.0)
+        self.assertAlmostEqual(
+            float(s.pct_change().dropna().iloc[0]), 0.0, places=6)
+
+    def test_bh_and_ma_same_period_count_and_years(self):
+        from scripts.midea_timing_backtest import run_buy_and_hold
+
+        bars = bars_from_closes(uptrend())
+        start_date = (BASE + timedelta(days=150)).strftime("%Y%m%d")
+        bh = run_buy_and_hold(bars, start_date)
+        ma_series = self._run_ma(bars, start_date)
+        ma_period_count = len(ma_series) - 1
+        self.assertEqual(bh["period_count"], ma_period_count)
+        self.assertEqual(bh["years"], round(ma_period_count / self.ANNUAL_DAYS, 4))
+        self.assertGreater(bh["period_count"], 0)
+
+    def test_bh_primary_activity_is_clean_mtm(self):
+        from scripts.midea_timing_backtest import run_buy_and_hold
+
+        bars = bars_from_closes(uptrend())
+        bh = run_buy_and_hold(bars, "20200101")
+        self.assertEqual(bh["entries"], 1)
+        self.assertEqual(bh["exits"], 0)                  # no terminal exit in primary
+        self.assertEqual(bh["realized_stamp_duty"], 0.0)  # no realized sell
+        self.assertEqual(bh["primary_turnover"],
+                         round(bh["shares"] * bh["start_price"], 2))
+        self.assertEqual(bh["liquidated_exits"], 1)       # optional view adds the exit
 
 
 class NextBarExecutionTests(unittest.TestCase):

@@ -57,6 +57,29 @@ def size_board_lots(
     return int(cash / per_share_cost / lot_size) * lot_size
 
 
+def build_anchored_series(
+    anchor_value: float,
+    anchor_timestamp,
+    close_values,
+    close_timestamps,
+):
+    """Build one scored equity series used identically by both baselines:
+
+        point 0: analysis-start-open anchor (common initial equity)
+        point 1..N: one close-marked equity point per analysis trading bar
+
+    ``anchor_timestamp`` must be strictly before the first close timestamp so
+    the index is unambiguous (no duplicate datetimes). Both B&H and MA use
+    this shape, giving them the same number of scored return periods.
+    """
+    import pandas as pd
+
+    anchor = pd.Series([float(anchor_value)], index=[anchor_timestamp])
+    closes = pd.Series(list(close_values), index=list(close_timestamps))
+    series = pd.concat([anchor, closes])
+    return series
+
+
 def terminal_liquidation(
     equity: float,
     shares: float,
