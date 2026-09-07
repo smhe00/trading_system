@@ -26,6 +26,25 @@ def forward_returns(closes, horizon: int) -> list:
     return [forward_return(closes, i, horizon) for i in range(len(closes))]
 
 
+def regime_contained_sample(
+    dates, idx: int, horizon: int, start: str, end: str
+) -> bool:
+    """True when BOTH the state date ``idx`` and the forward target date
+    ``idx + horizon`` lie inside the calendar interval ``[start, end]``.
+
+    This prevents cross-regime contamination: a sample labelled OLD must
+    never use a target price from RECENT. Checking the target date only
+    defines the evaluation sample boundary — it does not introduce
+    look-ahead into the state calculation (which still uses data through
+    ``idx`` close only).
+    """
+    if dates is None or idx < 0 or idx + horizon >= len(dates):
+        return False
+    d_t = dates[idx]
+    d_th = dates[idx + horizon]
+    return start <= d_t <= end and start <= d_th <= end
+
+
 def select_regime_bars(bars, start: str, end: str) -> list:
     """Bars whose trading dates fall inside the calendar interval
     ``[start, end]`` (YYYYMMDD). Returns only available tradable bars inside

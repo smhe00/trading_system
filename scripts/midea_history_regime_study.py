@@ -39,6 +39,7 @@ from src.trader.strategies.midea_timing.research import (
     forward_returns,
     ma_state_at,
     position_series,
+    regime_contained_sample,
     select_regime_bars,
     sma_series,
     warmup_bars,
@@ -225,28 +226,37 @@ def summarize(vals):
     }
 
 
-def forward_diagnostic(closes, dates, horizons=(20, 60)):
-    """State-conditional forward returns per regime (descriptive only)."""
+def forward_diagnostic(closes, dates, regimes=None, horizons=(20, 60)):
+    """State-conditional forward returns per regime (descriptive only).
+
+    Every sample is regime-contained: BOTH the state date ``t`` and the
+    forward target date ``t+h`` must lie inside the same requested interval
+    (``regime_contained_sample``). A late-OLD sample whose target falls in
+    RECENT is therefore excluded. The state at ``t`` still uses only data
+    through ``t`` close.
+    """
+    if regimes is None:
+        regimes = REGIMES
     ma20 = sma_series(closes, 20)
     ma60 = sma_series(closes, 60)
     ma120 = sma_series(closes, 120)
     fwd = {h: forward_returns(closes, h) for h in horizons}
 
     buckets = {}
-    for name, (s, e) in REGIMES.items():
+    for name, (s, e) in regimes.items():
         buckets[name] = {"LONG": {h: [] for h in horizons}, "CASH": {h: [] for h in horizons}}
 
     for i in range(len(closes)):
         state = ma_state_at(closes, ma20, ma60, ma120, i)
         if state is None:
             continue
-        date_str = dates[i]
         key = "LONG" if state else "CASH"
-        for name, (s, e) in REGIMES.items():
-            if s <= date_str <= e:
-                for h in horizons:
-                    if fwd[h][i] is not None:
-                        buckets[name][key][h].append(fwd[h][i])
+        for name, (s, e) in regimes.items():
+            for h in horizons:
+                if not regime_contained_sample(dates, i, h, s, e):
+                    continue
+                if fwd[h][i] is not None:
+                    buckets[name][key][h].append(fwd[h][i])
 
     out = {}
     for name, states in buckets.items():
@@ -291,12 +301,15 @@ def feature_drift(closes, dates):
         out[name] = {}
         for k, vals in cols.items():
             vals_sorted = sorted(vals)
-            n = len(vals_sorted)
+            # One documented quantile convention (standard-library inclusive
+            # quartiles), applied consistently to every feature.
+            q25, _median, q75 = statistics.quantiles(
+                vals_sorted, n=4, method="inclusive")
             out[name][k] = {
                 "median": round(statistics.median(vals_sorted), 4),
-                "q25": round(vals_sorted[max(0, n // 4 - 1)], 4),
-                "q75": round(vals_sorted[min(n - 1, 3 * n // 4)], 4),
-                "count": n,
+                "q25": round(q25, 4),
+                "q75": round(q75, 4),
+                "count": len(vals_sorted),
             }
     return out
 

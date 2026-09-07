@@ -16,6 +16,7 @@ from src.trader.strategies.midea_timing.research import (
     forward_returns,
     ma_state_at,
     position_series,
+    regime_contained_sample,
     select_regime_bars,
     sma_series,
     warmup_bars,
@@ -145,6 +146,65 @@ class ComparatorBehaviorTests(unittest.TestCase):
         self.assertLessEqual(sc["shares"], bh["shares"])  # exposure <= full B&H
         self.assertGreaterEqual(sc["initial_deployed_fraction"], 0.0)
         self.assertLessEqual(sc["initial_deployed_fraction"], 1.0)
+
+
+class ForwardContainmentTests(unittest.TestCase):
+    """R20/R60 samples must be censored when t+h leaves the evaluated regime."""
+
+    OLD_END = ("20201201", "20201231")
+
+    def _dates(self):
+        return ["202012%02d" % d for d in range(1, 32)] + ["20210104", "20210105"]
+
+    def test_sample_crossing_regime_end_is_excluded(self):
+        dates = self._dates()
+        s, e = self.OLD_END
+        # t=20201230 (idx 29), t+2 -> 20210104 outside -> excluded
+        self.assertFalse(regime_contained_sample(dates, 29, 2, s, e))
+        # t=20201230, t+1 -> 20201231 (still inside) -> accepted
+        self.assertTrue(regime_contained_sample(dates, 29, 1, s, e))
+
+    def test_r20_and_r60_crossings_are_excluded(self):
+        dates = self._dates()
+        s, e = self.OLD_END
+        # t=20201215 (idx 14), t+20 -> beyond -> excluded for R20 and R60
+        self.assertFalse(regime_contained_sample(dates, 14, 20, s, e))
+        self.assertFalse(regime_contained_sample(dates, 14, 60, s, e))
+
+    def test_target_exactly_on_last_included_date_is_accepted(self):
+        dates = self._dates()
+        s, e = self.OLD_END
+        # t=20201230 (idx 29), t+1 -> 20201231 == regime last included date
+        self.assertTrue(regime_contained_sample(dates, 29, 1, s, e))
+
+    def test_old_target_never_in_recent(self):
+        dates = self._dates()
+        s, e = ("20201225", "20201231")     # a true OLD interval ending before 2021
+        for i in range(len(dates) - 1):
+            if not (s <= dates[i] <= e):
+                continue                    # only samples whose state date is inside
+            target_recent = dates[i + 1] >= "20210101"
+            self.assertEqual(
+                regime_contained_sample(dates, i, 1, s, e),
+                not target_recent,
+            )
+
+    def test_diagnostic_never_consumes_next_regime_target(self):
+        from scripts.midea_history_regime_study import forward_diagnostic
+
+        # Two disjoint regimes; closes are rising so state is LONG after warm-up.
+        regimes = {"R1": ("20200101", "20200331"), "R2": ("20200401", "20200630")}
+        closes = [100.0 + i for i in range(200)]
+        dates = [(BASE + timedelta(days=i)).strftime("%Y%m%d") for i in range(200)]
+        out = forward_diagnostic(closes, dates, regimes=regimes)
+        for name in regimes:
+            # every sample's target date must lie inside the same regime:
+            # with containment, R1 samples can only have t+20/t+60 before 20200401.
+            r1_target_max = max(
+                i for i in range(len(dates))
+                if i + 60 < len(dates) and regime_contained_sample(
+                    dates, i, 60, *regimes["R1"]))
+            self.assertLess(dates[r1_target_max + 60], "20200401")
 
 
 class StateDiagnosticTests(unittest.TestCase):
