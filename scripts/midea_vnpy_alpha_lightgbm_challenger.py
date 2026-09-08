@@ -149,7 +149,6 @@ def run_fold(bars, raw_df, tgt_map, fold, lab, tag, train_years):
     fit_period = fold["fit"]
     valid_period = fold["valid"]
     test_period = fold["test"]
-    declared_train_end = fold["declared_train"][1]
 
     ds = AlphaDataset(
         raw_df,
@@ -166,8 +165,9 @@ def run_fold(bars, raw_df, tgt_map, fold, lab, tag, train_years):
     # `if self.label_expression:` truthiness, which raises on polars 1.x.
     label_result = raw_df.select(["datetime", "vt_symbol", LABEL_Y20.alias("data")])
     ds.add_feature("label", result=label_result)
-    # Purge at the DECLARED training-window end (never cross into OOS test).
-    ds.add_processor("learn", make_purge_processor(tgt_map, declared_train_end))
+    # Segment-aware label containment: FIT labels must end by fit_end, VALID
+    # labels by valid_end (strictly before OOS).
+    ds.add_processor("learn", make_purge_processor(tgt_map, fit_period[1], valid_period[1]))
     ds.prepare_data(max_workers=1)
     ds.process_data()
 
@@ -181,8 +181,16 @@ def run_fold(bars, raw_df, tgt_map, fold, lab, tag, train_years):
     )
     model.fit(ds)
 
-    train_count = len(ds.fetch_learn(Segment.TRAIN))
-    valid_count = len(ds.fetch_learn(Segment.VALID))
+    fit_df = ds.fetch_learn(Segment.TRAIN)
+    valid_df = ds.fetch_learn(Segment.VALID)
+    train_count = len(fit_df)
+    valid_count = len(valid_df)
+
+    def max_target_date(frame):
+        vals = [tgt_map.get(d) for d in frame["datetime"]]
+        vals = [v for v in vals if v is not None]
+        return max(vals).strftime("%Y-%m-%d") if vals else None
+
     infer = ds.fetch_infer(Segment.TEST).sort(["datetime", "vt_symbol"])
     preds = model.predict(ds, Segment.TEST)
 
@@ -212,10 +220,13 @@ def run_fold(bars, raw_df, tgt_map, fold, lab, tag, train_years):
         "declared_train_range": "..".join(fold["declared_train"]),
         "fit_range": "..".join(fit_period),
         "valid_range": "..".join(valid_period),
+        "test_range": "..".join(test_period),
         "fit_valid_overlap": bool(
             fit_period[1] >= valid_period[0]),   # must be False
         "train_count_after_purge": train_count,
         "valid_count_after_purge": valid_count,
+        "max_fit_label_target_date": max_target_date(fit_df),
+        "max_valid_label_target_date": max_target_date(valid_df),
         "infer_count": len(infer),
         "oos_pred_count": len(pairs),
         "pairs": pairs,
@@ -390,9 +401,12 @@ def main():
         d = {"fold": fr["fold"], "train_years": fr["train_years"],
              "declared_train_range": fr["declared_train_range"],
              "fit_range": fr["fit_range"], "valid_range": fr["valid_range"],
+             "test_range": fr["test_range"],
              "fit_valid_overlap": fr["fit_valid_overlap"],
              "train_count_after_purge": fr["train_count_after_purge"],
              "valid_count_after_purge": fr["valid_count_after_purge"],
+             "max_fit_label_target_date": fr["max_fit_label_target_date"],
+             "max_valid_label_target_date": fr["max_valid_label_target_date"],
              "infer_count": fr["infer_count"], "oos_pred_count": fr["oos_pred_count"]}
         d.update(pred_diagnostics(fr["pairs"]))
         fold_diag.append(d)

@@ -95,28 +95,36 @@ def fold_schedule(oos_years: list, train_years: int) -> list:
 
 
 class BoundaryPurgeProcessor:
-    """Picklable ``learn`` processor enforcing the boundary purge.
+    """Picklable, segment-aware ``learn`` processor enforcing label containment.
 
-    Implements the official AlphaDataset.add_processor extension point. A
-    training row is kept only when its y20 label target date (t+20) is inside
-    the training interval (never crossing into the OOS test period) and when
-    features/label are fully available (null OR NaN dropped, since
-    prepare_data fills nulls with NaN). Module-level and picklable so the
-    dataset can be persisted through the official AlphaLab.
+    Implements the official AlphaDataset.add_processor extension point with
+    per-segment target-date containment:
+
+        FIT row   (t <= fit_end)  : keep only if t+20 target date <= fit_end
+        VALID row (t > fit_end)   : keep only if t+20 target date <= valid_end
+
+    This guarantees no VALID-period price enters a FIT label and no OOS-period
+    price enters a VALID label (valid_end is the last day of the declared
+    training window, strictly before OOS). Rows with missing (null/NaN)
+    features/label are also dropped. Module-level and picklable so the dataset
+    can be persisted through the official AlphaLab.
     """
 
-    def __init__(self, target_date_map: dict, train_end: str):
+    def __init__(self, target_date_map: dict, fit_end: str, valid_end: str):
         self.target_date_map = target_date_map
-        self.train_end = train_end
+        self.fit_end = fit_end
+        self.valid_end = valid_end
         self.feat_cols = list(FROZEN_FEATURES)
 
     def __call__(self, df: pl.DataFrame) -> pl.DataFrame:
-        train_end_dt = datetime.strptime(self.train_end, "%Y-%m-%d")
+        fit_end_dt = datetime.strptime(self.fit_end, "%Y-%m-%d")
+        valid_end_dt = datetime.strptime(self.valid_end, "%Y-%m-%d")
         tgt = pl.Series([self.target_date_map.get(d) for d in df["datetime"]])
         df = df.with_columns(tgt.alias("__tgt"))
+        max_target = pl.when(pl.col("datetime") <= fit_end_dt).then(fit_end_dt).otherwise(valid_end_dt)
         df = df.filter(
             pl.col("__tgt").is_not_null()
-            & (pl.col("__tgt") <= train_end_dt)
+            & (pl.col("__tgt") <= max_target)
         ).drop("__tgt")
         for col in self.feat_cols + ["label"]:
             df = df.filter(
@@ -124,9 +132,9 @@ class BoundaryPurgeProcessor:
         return df
 
 
-def make_purge_processor(target_date_map: dict, train_end: str) -> BoundaryPurgeProcessor:
-    """Build the picklable boundary-purge learn processor (see class)."""
-    return BoundaryPurgeProcessor(target_date_map, train_end)
+def make_purge_processor(target_date_map: dict, fit_end: str, valid_end: str) -> BoundaryPurgeProcessor:
+    """Build the picklable segment-aware purge processor (see class)."""
+    return BoundaryPurgeProcessor(target_date_map, fit_end, valid_end)
 
 
 def simulate_ml(
@@ -140,21 +148,31 @@ def simulate_ml(
     lot_size: int = LOT_SIZE,
     gap_buffer: float = GAP_BUFFER,
 ):
-    """Deterministic next-bar ML timing simulation with locked conventions.
+    """Chronological pending-order ML timing simulation (locked conventions).
 
-    State per day: LONG iff predicted_y20 > 0, else CASH. The window starts
-    flat (position 0); an initial LONG signal is actionable and enters on the
-    next tradable bar (a first-state CASH does nothing).
+    Per bar ``t`` the simulator is strictly chronological:
 
-    Entry sizing mirrors the locked MaRegimeStrategy convention: the size
-    decision is made on the signal bar using ONLY information through its
-    close — ``max price = signal_close * gap_buffer``, buy costs reserved,
-    100-share lots. A buy limit of ``signal_close * 1.15`` (locked baseline)
-    fills on the next bar at ``min(limit, next_open)`` only if the next bar
-    traded down to the limit (``next_low <= limit``); a gap entirely above
-    the limit is handled explicitly as a no-fill (never silently assumed
-    filled). Exits fill at the next bar's open. Long-only; only transitions
-    trade (no redundant daily orders).
+      A. BAR OPEN / INTRABAR — process only an order already pending from a
+         prior signal bar (mutate cash/position only here):
+           BUY  fills when ``bar.low  <= buy_limit``  at ``min(open, buy_limit)``
+           SELL fills when ``bar.high >= sell_limit`` at ``max(open, sell_limit)``
+         otherwise the order stays pending.
+      B. BAR CLOSE — mark equity using the position actually held at t close.
+      C. AFTER CLOSE — read the t state (LONG iff predicted_y20 > 0) and
+         create/cancel a SINGLE pending order that cannot execute before the
+         next tradable bar.
+
+    Hard invariant: no bar-t equity value depends on bar t+1 data. An initial
+    LONG signal on the first bar keeps that bar's close equity at 1,000,000
+    (still flat); the earliest possible fill is the next tradable bar. A
+    no-fill order remains pending until it fills or the desired state changes
+    (then it is cancelled) — it never suppresses the target state, and no
+    duplicate pending orders are stacked.
+
+    Buy sizing follows the locked conservative-capital convention: size at the
+    signal close with ``max price = signal_close * gap_buffer`` and buy costs
+    reserved; ``buy_limit = signal_close * 1.15``. Exit uses the symmetric
+    ``sell_limit = signal_close * 0.85``. Long-only.
     """
     window = [b for b in bars
               if window_start <= b.datetime.strftime("%Y%m%d") <= window_end]
@@ -163,48 +181,74 @@ def simulate_ml(
 
     cash = float(capital)
     pos = 0
-    prev_state = "CASH"      # window starts flat; initial LONG is actionable
-    rows = []                # (date_str, equity)
-    trades = []              # {"direction": "LONG"/"SELL", "date", "price", "volume"}
+    pending = None       # {"side": "BUY"/"SELL", "limit": float, "volume": int}
+    rows = []            # (date_str, equity)
+    trades = []          # {"direction": "LONG"/"SELL", "date", "price", "volume"}
 
-    for i, b in enumerate(window):
+    for b in window:
         date_str = b.datetime.strftime("%Y%m%d")
-        pred = pred_by_date.get(date_str)
-        state = "LONG" if (pred is not None and pred > 0) else "CASH"
 
-        if state != prev_state and i + 1 < len(window):
-            nxt = window[i + 1]
-            if state == "LONG":
-                # Size decision on the signal bar using only information
-                # through t close (locked conservative-capital convention).
-                max_price = b.close_price * gap_buffer
-                target = size_board_lots(
-                    cash, max_price, commission_rate, slippage, lot_size)
-                limit = b.close_price * 1.15
-                # Next-bar fill only if the bar can execute the limit order.
-                if target >= lot_size and nxt.low_price <= limit:
-                    fill = min(limit, nxt.open_price)
-                    cash -= target * fill * (1 + commission_rate) + target * slippage
-                    pos = target
+        # A. process pending order at this bar's open
+        if pending is not None:
+            if pending["side"] == "BUY":
+                if b.low_price <= pending["limit"]:
+                    fill = min(b.open_price, pending["limit"])
+                    vol = pending["volume"]
+                    cash -= vol * fill * (1 + commission_rate) + vol * slippage
+                    pos = vol
                     trades.append({
-                        "direction": "LONG",
-                        "date": nxt.datetime.strftime("%Y%m%d"),
-                        "price": fill,
-                        "volume": target,
+                        "direction": "LONG", "date": date_str,
+                        "price": fill, "volume": vol,
                     })
-            else:
-                if pos > 0:
-                    cash += pos * nxt.open_price * (1 - commission_rate) - pos * slippage
+                    pending = None
+            else:  # SELL
+                if b.high_price >= pending["limit"]:
+                    fill = max(b.open_price, pending["limit"])
+                    vol = pos
+                    cash += vol * fill * (1 - commission_rate) - vol * slippage
                     trades.append({
-                        "direction": "SELL",
-                        "date": nxt.datetime.strftime("%Y%m%d"),
-                        "price": nxt.open_price,
-                        "volume": pos,
+                        "direction": "SELL", "date": date_str,
+                        "price": fill, "volume": vol,
                     })
                     pos = 0
+                    pending = None
 
-        prev_state = state
+        # B. mark equity at close with the position held at t close
         rows.append((date_str, cash + pos * b.close_price))
+
+        # C. after close: decide desired target state and manage the pending order
+        pred = pred_by_date.get(date_str)
+        desired_long = pred is not None and pred > 0
+        if desired_long:
+            if pos == 0:
+                if pending is None:
+                    max_price = b.close_price * gap_buffer
+                    target = size_board_lots(
+                        cash, max_price, commission_rate, slippage, lot_size)
+                    if target >= lot_size:
+                        pending = {
+                            "side": "BUY",
+                            "limit": b.close_price * 1.15,
+                            "volume": target,
+                        }
+                elif pending["side"] == "SELL":
+                    pending = None          # state back to LONG: cancel exit
+            else:
+                if pending is not None and pending["side"] == "SELL":
+                    pending = None          # already long: cancel stale exit
+        else:  # desired CASH
+            if pos > 0:
+                if pending is None:
+                    pending = {
+                        "side": "SELL",
+                        "limit": b.close_price * 0.85,
+                        "volume": pos,
+                    }
+                elif pending["side"] == "BUY":
+                    pending = None          # state back to CASH: cancel entry
+            else:
+                if pending is not None and pending["side"] == "BUY":
+                    pending = None          # flat and want cash: cancel stale entry
 
     return {
         "rows": rows,

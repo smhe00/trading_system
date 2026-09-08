@@ -115,29 +115,37 @@ class FoldScheduleTests(unittest.TestCase):
 
 
 class PurgeProcessorTests(unittest.TestCase):
-    def test_training_labels_do_not_cross_into_oos(self):
-        bars = make_bars([100.0 + i for i in range(400)])
+    def test_segment_aware_label_containment(self):
+        # bars span 2019-11 .. 2021-01 so t+20 crosses year boundaries
+        bars = make_bars([100.0 + i for i in range(460)],
+                         start=datetime(2019, 11, 1))
         tgt_map = {}
         for i, b in enumerate(bars):
             tgt_map[b.datetime] = bars[i + 20].datetime if i + 20 < len(bars) else None
-        proc = make_purge_processor(tgt_map, "2020-12-31")
-        # learn_df rows at 2020-12-20 (t+20 -> 2021-01-xx) must be dropped;
-        # rows at 2020-12-01 (t+20 -> 2020-12-21) kept.
+        proc = make_purge_processor(tgt_map, "2019-12-31", "2020-12-31")
         feat_cols = list(FROZEN_FEATURES)
+        rows = [
+            (datetime(2019, 12, 1), "fit_keep"),     # t+20=2019-12-21 <= fit_end
+            (datetime(2019, 12, 20), "fit_cross"),   # t+20=2020-01-xx > fit_end (VALID year)
+            (datetime(2020, 6, 1), "valid_keep"),    # t+20=2020-06-21 <= valid_end
+            (datetime(2020, 12, 20), "valid_oos"),   # t+20=2021-01-xx > valid_end (OOS)
+        ]
         df = pl.DataFrame({
-            "datetime": [datetime(2020, 12, 1), datetime(2020, 12, 20)],
-            "vt_symbol": ["000333.SZSE", "000333.SZSE"],
-            **{c: [1.0, 1.0] for c in feat_cols},
-            "label": [0.1, 0.1],
+            "datetime": [r[0] for r in rows],
+            "vt_symbol": ["000333.SZSE"] * len(rows),
+            **{c: [1.0] * len(rows) for c in feat_cols},
+            "label": [0.1] * len(rows),
         })
         out = proc(df)
-        self.assertEqual(len(out), 1)
-        self.assertEqual(out["datetime"][0], datetime(2020, 12, 1))
+        kept = {r[0] for r in rows if r[1] in ("fit_keep", "valid_keep")}
+        self.assertEqual(set(out["datetime"].to_list()), kept)
+        self.assertNotIn(datetime(2019, 12, 20), set(out["datetime"].to_list()))
+        self.assertNotIn(datetime(2020, 12, 20), set(out["datetime"].to_list()))
 
     def test_null_label_rows_are_dropped(self):
         bars = make_bars([100.0 + i for i in range(40)])
         tgt_map = {b.datetime: None for b in bars}      # no valid targets
-        proc = make_purge_processor(tgt_map, "2020-12-31")
+        proc = make_purge_processor(tgt_map, "2020-06-30", "2020-12-31")
         feat_cols = list(FROZEN_FEATURES)
         df = pl.DataFrame({
             "datetime": [datetime(2020, 1, 1)],
@@ -243,6 +251,112 @@ class MlmSimulationTests(unittest.TestCase):
         res = simulate_ml(bars, pred, "20200101", "20200103")
         self.assertEqual([t for t in res["trades"] if t["direction"] == "LONG"], [])
         self.assertEqual(res["pos"], 0)
+
+
+class MlTimelineTests(unittest.TestCase):
+    """Chronological pending-order semantics: no bar-t equity depends on t+1."""
+
+    def test_signal_day_equity_unchanged_by_next_day_fill(self):
+        bars = make_bars([100.0] * 4, opens=[99.0, 100.0, 101.0, 102.0])
+        pred = {"20200101": 0.2, "20200102": 0.2, "20200103": 0.2, "20200104": 0.2}
+        res = simulate_ml(bars, pred, "20200101", "20200104")
+        # first signal day close stays flat at 1,000,000; fill earliest bar2
+        self.assertEqual(res["rows"][0][1], 1_000_000.0)
+        longs = [t for t in res["trades"] if t["direction"] == "LONG"]
+        self.assertEqual(len(longs), 1)
+        self.assertEqual(longs[0]["date"], "20200102")   # next tradable bar
+        self.assertNotEqual(res["rows"][1][1], 1_000_000.0)  # position on fill date
+
+    def test_position_appears_starting_on_fill_date_not_earlier(self):
+        bars = make_bars([100.0] * 3, opens=[99.0, 100.0, 101.0])
+        pred = {"20200101": 0.2, "20200102": 0.2, "20200103": 0.2}
+        res = simulate_ml(bars, pred, "20200101", "20200103")
+        eq0 = res["rows"][0][1]   # 20200101 close, before any fill -> flat
+        eq1 = res["rows"][1][1]   # 20200102 close, after fill on bar1
+        self.assertEqual(eq0, 1_000_000.0)
+        self.assertNotEqual(eq1, 1_000_000.0)   # position affects equity from fill date only
+
+    def test_one_bar_no_fill_then_later_crossing_one_fill(self):
+        bars = make_bars([100.0] * 4, opens=[99.0, 130.0, 100.0, 101.0])
+        bars[1].low_price = 125.0       # bar1 never trades down to limit 115
+        bars[2].low_price = 98.0        # bar2 crosses -> fill
+        pred = {"20200101": 0.2, "20200102": 0.2, "20200103": 0.2, "20200104": 0.2}
+        res = simulate_ml(bars, pred, "20200101", "20200104")
+        longs = [t for t in res["trades"] if t["direction"] == "LONG"]
+        self.assertEqual(len(longs), 1)                 # one eventual fill
+        self.assertEqual(longs[0]["date"], "20200103")  # the crossing bar
+
+    def test_no_fill_long_then_cash_cancels_entry(self):
+        # Keep every bar's low above the buy limit so the pending never fills,
+        # then a CASH signal cancels it.
+        bars = make_bars([100.0] * 4, opens=[99.0, 130.0, 130.0, 130.0])
+        bars[1].low_price = 125.0
+        bars[2].low_price = 125.0
+        bars[3].low_price = 125.0
+        pred = {"20200101": 0.2, "20200102": 0.2, "20200103": -0.2, "20200104": -0.2}
+        res = simulate_ml(bars, pred, "20200101", "20200104")
+        self.assertEqual([t for t in res["trades"] if t["direction"] == "LONG"], [])
+        self.assertEqual(res["pos"], 0)
+
+    def test_no_duplicate_stacked_entries(self):
+        bars = make_bars([100.0] * 6, opens=[99.0, 100.0, 101.0, 102.0, 103.0, 104.0])
+        pred = {f"2020010{d}": 0.2 for d in range(1, 7)}
+        res = simulate_ml(bars, pred, "20200101", "20200106")
+        self.assertEqual(len([t for t in res["trades"] if t["direction"] == "LONG"]), 1)
+
+    def test_exit_signal_does_not_change_signal_day_equity_or_position(self):
+        bars = make_bars([100.0] * 6, opens=[99.0, 100.0, 101.0, 102.0, 103.0, 104.0])
+        pred = {"20200101": 0.2, "20200102": 0.2, "20200103": 0.2,
+                "20200104": -0.2, "20200105": -0.2, "20200106": -0.2}
+        res = simulate_ml(bars, pred, "20200101", "20200106")
+        longs = [t for t in res["trades"] if t["direction"] == "LONG"]
+        sells = [t for t in res["trades"] if t["direction"] == "SELL"]
+        self.assertEqual(longs[0]["date"], "20200102")
+        self.assertEqual(sells[0]["date"], "20200105")
+        # CASH signal day (20200104) equity is UNCHANGED by the sell, which
+        # fills on the next bar: 20200103 and 20200104 closes both hold the
+        # same position (same close price -> same equity), then the sell on
+        # 20200105 at a higher price raises equity.
+        self.assertEqual(res["rows"][2][1], res["rows"][3][1])
+        self.assertGreater(res["rows"][4][1], res["rows"][3][1])
+
+    def test_sell_limit_no_fill_persists_then_fills_on_crossing(self):
+        bars = make_bars([100.0] * 6, opens=[99.0, 100.0, 101.0, 102.0, 10.0, 104.0])
+        # bar4 opens 10 (sell limit 85 -> high must be >= 85): set high manually
+        bars[4].high_price = 50.0        # no cross
+        bars[5].high_price = 120.0       # cross -> fill
+        pred = {"20200101": 0.2, "20200102": 0.2, "20200103": 0.2,
+                "20200104": -0.2, "20200105": -0.2, "20200106": -0.2}
+        res = simulate_ml(bars, pred, "20200101", "20200106")
+        sells = [t for t in res["trades"] if t["direction"] == "SELL"]
+        self.assertEqual(len(sells), 1)
+        self.assertEqual(sells[0]["date"], "20200106")   # the crossing bar
+
+    def test_no_duplicate_stacked_exits(self):
+        bars = make_bars([100.0] * 7, opens=[99.0, 100.0, 101.0, 102.0, 103.0, 104.0, 105.0])
+        pred = {"20200101": 0.2, "20200102": 0.2, "20200103": 0.2,
+                "20200104": -0.2, "20200105": -0.2, "20200106": -0.2, "20200107": -0.2}
+        res = simulate_ml(bars, pred, "20200101", "20200107")
+        self.assertEqual(len([t for t in res["trades"] if t["direction"] == "SELL"]), 1)
+
+    def test_cash_never_negative_under_modeled_fills(self):
+        bars = make_bars([100.0] * 6, opens=[99.0, 130.0, 110.0, 102.0, 103.0, 104.0])
+        bars[1].low_price = 120.0
+        bars[2].low_price = 108.0
+        pred = {"20200101": 0.2, "20200102": 0.2, "20200103": 0.2,
+                "20200104": -0.2, "20200105": -0.2, "20200106": -0.2}
+        res = simulate_ml(bars, pred, "20200101", "20200106")
+        self.assertGreaterEqual(res["cash"], 0.0)
+
+    def test_trade_dates_match_actual_fill_bars(self):
+        bars = make_bars([100.0] * 6, opens=[99.0, 130.0, 100.0, 102.0, 103.0, 104.0])
+        bars[1].low_price = 125.0       # no fill on bar1
+        bars[2].low_price = 98.0        # fill on bar2
+        pred = {"20200101": 0.2, "20200102": 0.2, "20200103": 0.2,
+                "20200104": -0.2, "20200105": -0.2, "20200106": -0.2}
+        res = simulate_ml(bars, pred, "20200101", "20200106")
+        for t in res["trades"]:
+            self.assertIn(t["date"], [b.datetime.strftime("%Y%m%d") for b in bars])
 
 
 class StaticFractionTests(unittest.TestCase):
