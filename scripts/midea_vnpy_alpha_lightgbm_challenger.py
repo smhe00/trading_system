@@ -140,17 +140,22 @@ def target_date_map(bars) -> dict:
 
 
 def run_fold(bars, raw_df, tgt_map, fold, lab, tag, train_years):
-    """Official vnpy.alpha fold: dataset -> purge -> LgbModel fit -> OOS preds."""
+    """Official vnpy.alpha fold: non-overlapping fit/valid split inside the
+    declared training window, LgbModel fit (early stopping on the disjoint
+    valid set), then OOS predictions."""
     from vnpy.alpha import AlphaDataset, Segment
     from vnpy.alpha.model.models.lgb_model import LgbModel
 
-    train_start, train_end, valid_start, valid_end, test_start, test_end = fold
+    fit_period = fold["fit"]
+    valid_period = fold["valid"]
+    test_period = fold["test"]
+    declared_train_end = fold["declared_train"][1]
 
     ds = AlphaDataset(
         raw_df,
-        (train_start, train_end),
-        (valid_start, valid_end),
-        (test_start, test_end),
+        fit_period,
+        valid_period,
+        test_period,
     )
     # Official expression path for the frozen features (polars expressions).
     for name, expr in FROZEN_FEATURES.items():
@@ -161,7 +166,8 @@ def run_fold(bars, raw_df, tgt_map, fold, lab, tag, train_years):
     # `if self.label_expression:` truthiness, which raises on polars 1.x.
     label_result = raw_df.select(["datetime", "vt_symbol", LABEL_Y20.alias("data")])
     ds.add_feature("label", result=label_result)
-    ds.add_processor("learn", make_purge_processor(tgt_map, train_end))
+    # Purge at the DECLARED training-window end (never cross into OOS test).
+    ds.add_processor("learn", make_purge_processor(tgt_map, declared_train_end))
     ds.prepare_data(max_workers=1)
     ds.process_data()
 
@@ -176,6 +182,7 @@ def run_fold(bars, raw_df, tgt_map, fold, lab, tag, train_years):
     model.fit(ds)
 
     train_count = len(ds.fetch_learn(Segment.TRAIN))
+    valid_count = len(ds.fetch_learn(Segment.VALID))
     infer = ds.fetch_infer(Segment.TEST).sort(["datetime", "vt_symbol"])
     preds = model.predict(ds, Segment.TEST)
 
@@ -200,9 +207,15 @@ def run_fold(bars, raw_df, tgt_map, fold, lab, tag, train_years):
     lab.save_signal(f"{tag}_signal", infer.with_columns(pl.Series("signal", preds)))
 
     return {
-        "fold": f"{test_start}..{test_end}",
+        "fold": f"{test_period[0]}..{test_period[1]}",
         "train_years": train_years,
+        "declared_train_range": "..".join(fold["declared_train"]),
+        "fit_range": "..".join(fit_period),
+        "valid_range": "..".join(valid_period),
+        "fit_valid_overlap": bool(
+            fit_period[1] >= valid_period[0]),   # must be False
         "train_count_after_purge": train_count,
+        "valid_count_after_purge": valid_count,
         "infer_count": len(infer),
         "oos_pred_count": len(pairs),
         "pairs": pairs,
@@ -364,7 +377,7 @@ def main():
     fold_results = []
     for train_years, oos_years in ((3, OOS_3Y), (5, OOS_5Y)):
         for fold in fold_schedule(oos_years, train_years):
-            tag = f"y{train_years}_{fold[4][:4]}"
+            tag = f"y{train_years}_{fold['test'][0][:4]}"
             fr = run_fold(bars, raw_df, tgt_map, fold, lab, tag, train_years)
             fold_results.append(fr)
 
@@ -375,7 +388,11 @@ def main():
     fold_diag = []
     for fr in fold_results:
         d = {"fold": fr["fold"], "train_years": fr["train_years"],
+             "declared_train_range": fr["declared_train_range"],
+             "fit_range": fr["fit_range"], "valid_range": fr["valid_range"],
+             "fit_valid_overlap": fr["fit_valid_overlap"],
              "train_count_after_purge": fr["train_count_after_purge"],
+             "valid_count_after_purge": fr["valid_count_after_purge"],
              "infer_count": fr["infer_count"], "oos_pred_count": fr["oos_pred_count"]}
         d.update(pred_diagnostics(fr["pairs"]))
         fold_diag.append(d)

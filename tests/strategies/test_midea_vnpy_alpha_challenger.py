@@ -86,23 +86,32 @@ class LabelTests(unittest.TestCase):
 class FoldScheduleTests(unittest.TestCase):
     def test_3y_train_is_exactly_prior_3_calendar_years(self):
         folds = fold_schedule([2018, 2024, 2026], 3)
-        by_year = {f[4][:4]: f for f in folds}
-        self.assertEqual(by_year["2018"][:2], ("2015-01-01", "2017-12-31"))
-        self.assertEqual(by_year["2024"][:2], ("2021-01-01", "2023-12-31"))
-        self.assertEqual(by_year["2026"][:2], ("2023-01-01", "2025-12-31"))
-        self.assertEqual(by_year["2026"][4], "2026-01-01")
+        by_year = {f["test"][0][:4]: f for f in folds}
+        self.assertEqual(by_year["2018"]["declared_train"], ("2015-01-01", "2017-12-31"))
+        self.assertEqual(by_year["2024"]["declared_train"], ("2021-01-01", "2023-12-31"))
+        self.assertEqual(by_year["2026"]["declared_train"], ("2023-01-01", "2025-12-31"))
+        self.assertEqual(by_year["2026"]["test"], ("2026-01-01", "2026-12-31"))
         self.assertEqual(len(folds), 3)                 # one fold per OOS year
 
     def test_5y_train_is_exactly_prior_5_calendar_years(self):
         folds = fold_schedule([2020, 2026], 5)
-        by_year = {f[4][:4]: f for f in folds}
-        self.assertEqual(by_year["2020"][:2], ("2015-01-01", "2019-12-31"))
-        self.assertEqual(by_year["2026"][:2], ("2021-01-01", "2025-12-31"))
+        by_year = {f["test"][0][:4]: f for f in folds}
+        self.assertEqual(by_year["2020"]["declared_train"], ("2015-01-01", "2019-12-31"))
+        self.assertEqual(by_year["2026"]["declared_train"], ("2021-01-01", "2025-12-31"))
+        self.assertEqual(by_year["2020"]["fit"], ("2015-01-01", "2018-12-31"))
+        self.assertEqual(by_year["2020"]["valid"], ("2019-01-01", "2019-12-31"))
+
+    def test_fit_and_valid_are_non_overlapping(self):
+        folds = fold_schedule([2021, 2026], 3)
+        for f in folds:
+            self.assertLess(f["fit"][1], f["valid"][0])      # fit ends before valid starts
+            self.assertEqual(f["fit"][0], f["declared_train"][0])
+            self.assertEqual(f["valid"][1], f["declared_train"][1])
 
     def test_valid_is_last_train_year_and_test_is_oos_year(self):
         folds = fold_schedule([2021], 3)
-        self.assertEqual(folds[0][2:4], ("2020-01-01", "2020-12-31"))
-        self.assertEqual(folds[0][4:], ("2021-01-01", "2021-12-31"))
+        self.assertEqual(folds[0]["valid"], ("2020-01-01", "2020-12-31"))
+        self.assertEqual(folds[0]["test"], ("2021-01-01", "2021-12-31"))
 
 
 class PurgeProcessorTests(unittest.TestCase):
@@ -164,7 +173,76 @@ class MlmSimulationTests(unittest.TestCase):
         pred = {"20200102": 0.1, "20200103": 0.1, "20200104": 0.1, "20200105": 0.1}
         res = simulate_ml(bars, pred, "20200101", "20200105")
         longs = [t for t in res["trades"] if t["direction"] == "LONG"]
-        self.assertLessEqual(len(longs), 1)              # no redundant daily orders
+        self.assertEqual(len(longs), 1)                # exactly one entry, no redundancy
+
+    def test_initial_long_enters_on_next_tradable_bar(self):
+        # Predictions begin LONG on the FIRST window day and stay LONG.
+        bars = make_bars([100.0] * 5)
+        pred = {"20200101": 0.2, "20200102": 0.2, "20200103": 0.2,
+                "20200104": 0.2, "20200105": 0.2}
+        res = simulate_ml(bars, pred, "20200101", "20200105")
+        longs = [t for t in res["trades"] if t["direction"] == "LONG"]
+        self.assertEqual(len(longs), 1)                # exactly one entry
+        self.assertEqual(longs[0]["date"], "20200102") # next bar after first LONG signal
+        self.assertEqual(len([t for t in res["trades"] if t["direction"] == "SELL"]), 0)
+
+    def test_initial_cash_then_long_still_enters(self):
+        bars = make_bars([100.0] * 5)
+        pred = {"20200101": -0.1, "20200102": 0.2, "20200103": 0.2,
+                "20200104": 0.2, "20200105": 0.2}
+        res = simulate_ml(bars, pred, "20200101", "20200105")
+        longs = [t for t in res["trades"] if t["direction"] == "LONG"]
+        self.assertEqual(len(longs), 1)
+        self.assertEqual(longs[0]["date"], "20200103")  # entered after CASH->LONG
+
+    def test_sizing_uses_signal_close_times_gap_buffer_not_next_open(self):
+        from src.trader.strategies.midea_timing.ml_research import size_board_lots as sbl
+
+        closes = [100.0] * 4
+        opens = [99.0, 100.0, 101.0, 130.0]             # next open after signal = 130
+        bars = make_bars(closes, opens=opens)
+        pred = {"20200101": -0.1, "20200102": 0.2, "20200103": 0.2, "20200104": 0.2}
+        res = simulate_ml(bars, pred, "20200101", "20200104")
+        longs = [t for t in res["trades"] if t["direction"] == "LONG"]
+        self.assertEqual(len(longs), 1)
+        # size is driven by signal-close (100) * gap_buffer (1.20), not next open (130)
+        expected = sbl(1_000_000.0, 100.0 * 1.20, 0.0003, 0.01, 100)
+        self.assertEqual(longs[0]["volume"], expected)
+        self.assertNotEqual(expected, sbl(1_000_000.0, 130.0, 0.0003, 0.01, 100))
+
+    def test_gap_buffer_affects_quantity(self):
+        closes = [100.0] * 3
+        opens = [99.0, 100.0, 101.0]
+        bars = make_bars(closes, opens=opens)
+        pred = {"20200101": -0.1, "20200102": 0.2, "20200103": 0.2}
+        big = simulate_ml(bars, pred, "20200101", "20200103", gap_buffer=1.20)
+        small = simulate_ml(bars, pred, "20200101", "20200103", gap_buffer=1.05)
+        v_big = [t for t in big["trades"] if t["direction"] == "LONG"][0]["volume"]
+        v_small = [t for t in small["trades"] if t["direction"] == "LONG"][0]["volume"]
+        self.assertGreater(v_small, v_big)              # smaller buffer -> larger size
+
+    def test_plus_ten_percent_gap_is_fully_funded_no_negative_cash(self):
+        closes = [100.0] * 3
+        # next bar opens +10% (110) with low 109 (still <= limit 115) -> fills
+        opens = [99.0, 100.0, 110.0]
+        bars = make_bars(closes, opens=opens)
+        # override lows so the gap bar's low <= limit
+        bars[2].low_price = 109.0
+        pred = {"20200101": -0.1, "20200102": 0.2, "20200103": 0.2}
+        res = simulate_ml(bars, pred, "20200101", "20200103")
+        self.assertEqual(len([t for t in res["trades"] if t["direction"] == "LONG"]), 1)
+        self.assertGreaterEqual(res["cash"], 0.0)
+        self.assertGreaterEqual(res["pos"], 0.0)
+
+    def test_gap_beyond_buy_limit_is_no_fill_not_silent(self):
+        closes = [100.0] * 3
+        opens = [99.0, 100.0, 130.0]                    # next open +30% > limit 115
+        bars = make_bars(closes, opens=opens)
+        bars[2].low_price = 125.0                       # never trades down to limit
+        pred = {"20200101": -0.1, "20200102": 0.2, "20200103": 0.2}
+        res = simulate_ml(bars, pred, "20200101", "20200103")
+        self.assertEqual([t for t in res["trades"] if t["direction"] == "LONG"], [])
+        self.assertEqual(res["pos"], 0)
 
 
 class StaticFractionTests(unittest.TestCase):

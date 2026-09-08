@@ -65,18 +65,32 @@ LABEL_Y20 = pl.col("close").shift(-20) / pl.col("close") - 1
 
 
 def fold_schedule(oos_years: list, train_years: int) -> list:
-    """Annual walk-forward folds: for each OOS year, train on the prior
-    ``train_years`` full calendar years, valid on the last train year, test
-    on the OOS year. Returns tuples
-    (train_start, train_end, valid_start, valid_end, test_start, test_end).
+    """Annual walk-forward folds with a NON-OVERLAPPING fit/valid split.
+
+    For each OOS year ``Y`` the declared training window is the prior
+    ``train_years`` full calendar years (``Y-train_years-01-01 ..
+    Y-1-12-31``). The official LgbModel mandates a validation segment for
+    early stopping, so that declared window is split deterministically and
+    without overlap:
+
+        fit   = declared window minus its last calendar year
+        valid = the last calendar year of the declared window
+
+    Early-stopping feedback therefore never overlaps the fit rows, and no
+    OOS (test) data is used. Returns a dict per fold with ``declared_train``,
+    ``fit``, ``valid``, ``test`` as (start, end) date strings.
     """
     out = []
     for y in oos_years:
-        out.append((
-            f"{y - train_years}-01-01", f"{y - 1}-12-31",
-            f"{y - 1}-01-01", f"{y - 1}-12-31",
-            f"{y}-01-01", f"{y}-12-31",
-        ))
+        declared_start = f"{y - train_years}-01-01"
+        declared_end = f"{y - 1}-12-31"
+        valid_start = f"{y - 1}-01-01"
+        out.append({
+            "declared_train": (declared_start, declared_end),
+            "fit": (declared_start, f"{y - 2}-12-31"),
+            "valid": (valid_start, declared_end),
+            "test": (f"{y}-01-01", f"{y}-12-31"),
+        })
     return out
 
 
@@ -124,13 +138,23 @@ def simulate_ml(
     commission_rate: float = COMMISSION_RATE,
     slippage: float = SLIPPAGE,
     lot_size: int = LOT_SIZE,
+    gap_buffer: float = GAP_BUFFER,
 ):
     """Deterministic next-bar ML timing simulation with locked conventions.
 
-    State per day: LONG iff predicted_y20 > 0, else CASH. A state transition
-    decided after day t close is executed at the NEXT tradable bar's open.
-    Conservative sizing (gap_buffer) + cost-aware cash ledger; only
-    transitions trade (no redundant daily orders); long-only.
+    State per day: LONG iff predicted_y20 > 0, else CASH. The window starts
+    flat (position 0); an initial LONG signal is actionable and enters on the
+    next tradable bar (a first-state CASH does nothing).
+
+    Entry sizing mirrors the locked MaRegimeStrategy convention: the size
+    decision is made on the signal bar using ONLY information through its
+    close — ``max price = signal_close * gap_buffer``, buy costs reserved,
+    100-share lots. A buy limit of ``signal_close * 1.15`` (locked baseline)
+    fills on the next bar at ``min(limit, next_open)`` only if the next bar
+    traded down to the limit (``next_low <= limit``); a gap entirely above
+    the limit is handled explicitly as a no-fill (never silently assumed
+    filled). Exits fill at the next bar's open. Long-only; only transitions
+    trade (no redundant daily orders).
     """
     window = [b for b in bars
               if window_start <= b.datetime.strftime("%Y%m%d") <= window_end]
@@ -139,27 +163,33 @@ def simulate_ml(
 
     cash = float(capital)
     pos = 0
-    prev_state = None
-    rows = []        # (date_str, equity)
-    trades = []      # {"direction": "LONG"/"SELL", "date", "price", "volume"}
+    prev_state = "CASH"      # window starts flat; initial LONG is actionable
+    rows = []                # (date_str, equity)
+    trades = []              # {"direction": "LONG"/"SELL", "date", "price", "volume"}
 
     for i, b in enumerate(window):
         date_str = b.datetime.strftime("%Y%m%d")
         pred = pred_by_date.get(date_str)
         state = "LONG" if (pred is not None and pred > 0) else "CASH"
 
-        if prev_state is not None and state != prev_state and i + 1 < len(window):
+        if state != prev_state and i + 1 < len(window):
             nxt = window[i + 1]
             if state == "LONG":
+                # Size decision on the signal bar using only information
+                # through t close (locked conservative-capital convention).
+                max_price = b.close_price * gap_buffer
                 target = size_board_lots(
-                    cash, nxt.open_price, commission_rate, slippage, lot_size)
-                if target >= lot_size:
-                    cash -= target * nxt.open_price * (1 + commission_rate) + target * slippage
+                    cash, max_price, commission_rate, slippage, lot_size)
+                limit = b.close_price * 1.15
+                # Next-bar fill only if the bar can execute the limit order.
+                if target >= lot_size and nxt.low_price <= limit:
+                    fill = min(limit, nxt.open_price)
+                    cash -= target * fill * (1 + commission_rate) + target * slippage
                     pos = target
                     trades.append({
                         "direction": "LONG",
                         "date": nxt.datetime.strftime("%Y%m%d"),
-                        "price": nxt.open_price,
+                        "price": fill,
                         "volume": target,
                     })
             else:
